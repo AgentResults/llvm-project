@@ -344,9 +344,16 @@ foreach(header
   endif()
 endforeach()
 
-add_custom_command(TARGET liblldb-header-staging POST_BUILD
+# The version-fixed lldb-defines.h is the output of its own command, written again
+# only when its input or the script changes (a POST_BUILD of the utility target
+# ran it at every build).
+add_custom_command(
+  OUTPUT ${lldb_header_staging_dir}/lldb-defines.h
   COMMAND "${Python3_EXECUTABLE}" ${LLDB_SOURCE_DIR}/scripts/version-header-fix.py -i ${LLDB_SOURCE_DIR}/include/lldb/lldb-defines.h -o ${lldb_header_staging_dir}/lldb-defines.h -m ${LLDB_VERSION_MAJOR} -n ${LLDB_VERSION_MINOR} -p ${LLDB_VERSION_PATCH}
-)
+  DEPENDS ${LLDB_SOURCE_DIR}/include/lldb/lldb-defines.h ${LLDB_SOURCE_DIR}/scripts/version-header-fix.py liblldb-header-staging-dir
+  COMMENT "LLDB headers: fix the version in lldb-defines.h")
+add_custom_target(liblldb-stage-header-lldb-defines.h DEPENDS ${lldb_header_staging_dir}/lldb-defines.h)
+add_dependencies(liblldb-header-staging liblldb-stage-header-lldb-defines.h)
 add_dependencies(liblldb liblldb-header-staging)
 
 if(LLDB_BUILD_FRAMEWORK)
