@@ -295,7 +295,14 @@ add_custom_target(liblldb-header-staging-dir DEPENDS ${lldb_header_staging_dir})
 
 find_program(unifdef_EXECUTABLE unifdef)
 
-add_custom_target(liblldb-header-staging)
+# velite (AgentResults): the versioned lldb-defines.h is a custom command's OUTPUT, run when its inputs change, never a
+# POST_BUILD of a utility target, which is always considered out of date and ran at every build.
+add_custom_command(
+  OUTPUT ${lldb_header_staging_dir}/lldb-defines.h
+  COMMAND "${Python3_EXECUTABLE}" ${LLDB_SOURCE_DIR}/scripts/version-header-fix.py -i ${LLDB_SOURCE_DIR}/include/lldb/lldb-defines.h -o ${lldb_header_staging_dir}/lldb-defines.h -m ${LLDB_VERSION_MAJOR} -n ${LLDB_VERSION_MINOR} -p ${LLDB_VERSION_PATCH}
+  DEPENDS ${LLDB_SOURCE_DIR}/include/lldb/lldb-defines.h ${LLDB_SOURCE_DIR}/scripts/version-header-fix.py liblldb-header-staging-dir
+  COMMENT "LLDB headers: stage the versioned lldb-defines.h")
+add_custom_target(liblldb-header-staging DEPENDS ${lldb_header_staging_dir}/lldb-defines.h)
 
 if (LLDB_BUILD_FRAMEWORK)
   add_custom_target(lldb-framework-fixup-all-headers)
@@ -344,9 +351,6 @@ foreach(header
   endif()
 endforeach()
 
-add_custom_command(TARGET liblldb-header-staging POST_BUILD
-  COMMAND "${Python3_EXECUTABLE}" ${LLDB_SOURCE_DIR}/scripts/version-header-fix.py -i ${LLDB_SOURCE_DIR}/include/lldb/lldb-defines.h -o ${lldb_header_staging_dir}/lldb-defines.h -m ${LLDB_VERSION_MAJOR} -n ${LLDB_VERSION_MINOR} -p ${LLDB_VERSION_PATCH}
-)
 add_dependencies(liblldb liblldb-header-staging)
 
 if(LLDB_BUILD_FRAMEWORK)

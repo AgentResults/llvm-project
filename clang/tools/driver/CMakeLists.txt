@@ -92,6 +92,25 @@ foreach(link ${CLANG_LINKS_TO_CREATE} ${HLSL_LINK})
   add_clang_symlink(${link} clang)
 endforeach()
 
+# velite (AgentResults): the compiler declares the files that decide what it does -- the program and the libraries it
+# loads -- in the depfile it writes for the headers it read, so a build system reruns exactly the compiles whose compiler
+# changed. clang reads <mode>.cfg from its own directory and expands <CFGDIR> to it.
+set(clang_input_files "$<TARGET_FILE_NAME:clang>")
+if(CLANG_LINK_CLANG_DYLIB)
+  list(APPEND clang_input_files "../lib${LLVM_LIBDIR_SUFFIX}/$<TARGET_SONAME_FILE_NAME:clang-cpp>")
+endif()
+if(LLVM_LINK_LLVM_DYLIB)
+  list(APPEND clang_input_files "../lib${LLVM_LIBDIR_SUFFIX}/$<TARGET_SONAME_FILE_NAME:LLVM>")
+endif()
+set(clang_input_config "")
+foreach(f ${clang_input_files})
+  string(APPEND clang_input_config "-Xclang -fdepfile-entry=<CFGDIR>/${f}\n")
+endforeach()
+foreach(mode clang clang++)
+  file(GENERATE OUTPUT "${LLVM_RUNTIME_OUTPUT_INTDIR}/${mode}.cfg" CONTENT "${clang_input_config}")
+  install(FILES "${LLVM_RUNTIME_OUTPUT_INTDIR}/${mode}.cfg" DESTINATION "${CMAKE_INSTALL_BINDIR}" COMPONENT clang)
+endforeach()
+
 # Configure plist creation for OS X.
 set (TOOL_INFO_PLIST "Info.plist" CACHE STRING "Plist name")
 if (APPLE)
