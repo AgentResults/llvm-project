@@ -20,13 +20,13 @@
 #include "llvm/ADT/StringRef.h"
 #include "llvm/ADT/Twine.h"
 #include "llvm/Support/CommandLine.h"
+#include "llvm/Support/Error.h"
 #include "llvm/Support/ErrorOr.h"
 #include "llvm/Support/FileSystem.h"
 #include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/Path.h"
 #include "llvm/Support/SMLoc.h"
 #include "llvm/Support/SourceMgr.h"
-#include "llvm/Support/ToolOutputFile.h"
 #include "llvm/Support/VirtualFileSystem.h"
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/TableGen/Error.h"
@@ -91,27 +91,27 @@ static int createDependencyFile(const TGParser &Parser, const char *argv0) {
   if (OutputFilename == "-")
     return reportError(argv0, "the option -d must be used together with -o\n");
 
-  std::error_code EC;
-  ToolOutputFile DepOut(DependFilename, EC, sys::fs::OF_Text);
-  if (EC)
-    return reportError(argv0, "error opening " + DependFilename + ":" +
-                                  EC.message() + "\n");
-  DepOut.os() << OutputFilename << ":";
+  // velite (AgentResults): written to a new file and renamed onto its name,
+  // never into the file it names (writeToOutput), as every output is below.
+  if (Error E = writeToOutput(DependFilename, [&](raw_ostream &OS) {
+        OS << OutputFilename << ":";
 
-  // Emit the primary input file as a dependency. This matches C compilers like
-  // Clang and GCC. Without it, a .td file with no `include` directives would
-  // produce a depfile listing zero dependencies. CMake's
-  // `cmake_transform_depfile` then collapses that to a 0-byte file, which Ninja
-  // treats as a missing depfile and re-runs the rule on every incremental
-  // build.
-  if (InputFilename != "-")
-    DepOut.os() << ' ' << InputFilename;
+        // Emit the primary input file as a dependency. This matches C
+        // compilers like Clang and GCC. Without it, a .td file with no
+        // `include` directives would produce a depfile listing zero
+        // dependencies. CMake's `cmake_transform_depfile` then collapses that
+        // to a 0-byte file, which Ninja treats as a missing depfile and re-runs
+        // the rule on every incremental build.
+        if (InputFilename != "-")
+          OS << ' ' << InputFilename;
 
-  for (const auto &Dep : Parser.getDependencies()) {
-    DepOut.os() << ' ' << Dep;
-  }
-  DepOut.os() << "\n";
-  DepOut.keep();
+        for (const auto &Dep : Parser.getDependencies())
+          OS << ' ' << Dep;
+        OS << "\n";
+        return Error::success();
+      }))
+    return reportError(argv0, "error writing " + DependFilename + ": " +
+                                  toString(std::move(E)) + "\n");
   return 0;
 }
 
@@ -125,15 +125,22 @@ static int WriteOutput(const char *argv0, StringRef Filename,
       if (std::move(ExistingOrErr.get())->getBuffer() == Content)
         return 0;
   }
-  std::error_code EC;
-  ToolOutputFile OutFile(Filename, EC, sys::fs::OF_Text);
-  if (EC)
-    return reportError(argv0, "error opening " + Filename + ": " +
-                                  EC.message() + "\n");
-  OutFile.os() << Content;
-  if (ErrorsPrinted == 0)
-    OutFile.keep();
-
+  // velite (AgentResults): an output is written once, never into. ToolOutputFile
+  // opened the existing file truncating it (CD_CreateAlways) and wrote into it,
+  // so a file another path shares (a hard link from an earlier build's place)
+  // changed under that path too. writeToOutput writes a new file beside it and
+  // renames it onto its name. A run that printed errors leaves no output file,
+  // as ToolOutputFile's removal of an output it did not keep did.
+  if (ErrorsPrinted > 0 && Filename != "-") {
+    sys::fs::remove(Filename);
+    return 0;
+  }
+  if (Error E = writeToOutput(Filename, [&](raw_ostream &OS) {
+        OS << Content;
+        return Error::success();
+      }))
+    return reportError(argv0, "error writing " + Filename + ": " +
+                                  toString(std::move(E)) + "\n");
   return 0;
 }
 

@@ -1385,9 +1385,15 @@ function(process_llvm_pass_plugins)
       # LLVM_INSTALL_PACKAGE_DIR might be absolute, so don't reuse below.
       string(REPLACE "${CMAKE_CFG_INTDIR}" "." llvm_cmake_builddir "${LLVM_LIBRARY_DIR}")
       set(llvm_cmake_builddir "${llvm_cmake_builddir}/cmake/llvm")
-      file(WRITE
-          "${llvm_cmake_builddir}/LLVMConfigExtensions.cmake"
-          "set(LLVM_STATIC_EXTENSIONS ${LLVM_STATIC_EXTENSIONS})")
+      # velite (AgentResults): written once, never into. file(CONFIGURE) writes a
+      # new file and renames it onto this one only when the bytes differ, so an
+      # unchanged file keeps its inode and time and a path that shares it (a hard
+      # link from an earlier build's place) is never changed; file(WRITE) writes
+      # into it at every configure (CMake through 4.1).
+      file(CONFIGURE
+          OUTPUT "${llvm_cmake_builddir}/LLVMConfigExtensions.cmake"
+          CONTENT "set(LLVM_STATIC_EXTENSIONS ${LLVM_STATIC_EXTENSIONS})"
+          @ONLY)
       install(FILES
           ${llvm_cmake_builddir}/LLVMConfigExtensions.cmake
           DESTINATION ${LLVM_INSTALL_PACKAGE_DIR}

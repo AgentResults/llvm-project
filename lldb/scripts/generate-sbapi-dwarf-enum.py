@@ -47,21 +47,31 @@ def emit_enum(input, output):
     # Create output folder if it does not exist
     os.makedirs(os.path.dirname(output), exist_ok=True)
 
-    # Write the output.
-    with open(output, "w") as f:
-        # Emit the header.
-        f.write(HEADER)
+    # The output.
+    text = HEADER
+    for line in lines:
+        match = REGEX.match(line)
+        if not match:
+            continue
+        text += f"  /// {match.group('comment')}.\n"
+        text += f"  eLanguageName{match.group('name')} = {match.group('value')},\n"
+    text += FOOTER
 
-        # Emit the enum values.
-        for line in lines:
-            match = REGEX.match(line)
-            if not match:
-                continue
-            f.write(f"  /// {match.group('comment')}.\n")
-            f.write(f"  eLanguageName{match.group('name')} = {match.group('value')},\n")
-
-        # Emit the footer
-        f.write(FOOTER)
+    # velite (AgentResults): written once, never into. An output that already
+    # holds this text is left untouched (its inode and time), so nothing that
+    # includes it compiles again; another is written to a new file beside it and
+    # renamed onto it, so a path that shares the old file (a hard link from an
+    # earlier build's place) is never changed.
+    try:
+        with open(output, "r") as f:
+            if f.read() == text:
+                return
+    except FileNotFoundError:
+        pass
+    temporary = f"{output}.tmp{os.getpid()}"
+    with open(temporary, "w") as f:
+        f.write(text)
+    os.replace(temporary, output)
 
 
 def main():
