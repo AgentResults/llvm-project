@@ -17,7 +17,12 @@ function(LLVMBuildGenerateCFragment)
   endforeach()
 
   list(LENGTH llvmbuild_components llvmbuild_components_size)
-  file(WRITE ${ARG_OUTPUT}
+  # velite (AgentResults): the whole text is gathered and written once, never
+  # into: file(CONFIGURE) writes a new file and renames it onto ARG_OUTPUT only
+  # when the bytes differ, so an unchanged LibraryDependencies.inc keeps its time
+  # and llvm-config is not compiled again at every configure. file(WRITE) then
+  # file(APPEND) wrote it again at every configure, in place.
+  set(llvmbuild_text
   "
   struct AvailableComponent {
     /// The name of the component.
@@ -71,9 +76,10 @@ function(LLVMBuildGenerateCFragment)
 
   list(SORT llvmbuild_centries)
   foreach(llvmbuild_centry ${llvmbuild_centries})
-    file(APPEND ${ARG_OUTPUT} "${llvmbuild_centry}")
+    string(APPEND llvmbuild_text "${llvmbuild_centry}")
   endforeach()
-  file(APPEND ${ARG_OUTPUT} "};")
+  string(APPEND llvmbuild_text "};")
+  file(CONFIGURE OUTPUT ${ARG_OUTPUT} CONTENT "${llvmbuild_text}" @ONLY)
 endfunction()
 
 # Resolve cross-component dependencies, for each available component.

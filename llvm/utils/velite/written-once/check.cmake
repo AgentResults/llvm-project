@@ -1,13 +1,15 @@
-# velite (AgentResults): LLVMConfigExtensions.cmake is written once, never into.
+# velite (AgentResults): LLVMConfigExtensions.cmake and llvm-config's
+# LibraryDependencies.inc, which LLVM's configure writes, are written once,
+# never into.
 #
 #   cmake -DWORK=<an empty directory> -P llvm/utils/velite/written-once/check.cmake
 #
-# A configure that writes the same content leaves the file untouched (its inode
-# and time), and one that writes a new content replaces it with a new file, so a
-# path that shares the old file (a hard link from an earlier build's place)
-# keeps it. Run it with a CMake whose file(WRITE) writes into the file it names
-# (CMake's own, through 4.1): AddLLVM.cmake's write must not depend on the
-# CMake that runs it.
+# A configure that writes the same content leaves each file untouched (its inode
+# and time), so nothing that reads it is made again, and one that writes a new
+# content replaces it with a new file, so a path that shares the old file (a
+# hard link from an earlier build's place) keeps it. Run it with a CMake whose
+# file(WRITE) writes into the file it names (CMake's own, through 4.1) and with
+# ours: LLVM's writes must not depend on the CMake that runs them.
 if(NOT WORK)
   message(FATAL_ERROR "name an empty directory: -DWORK=<dir>")
 endif()
@@ -16,6 +18,7 @@ get_filename_component(modules "${CMAKE_CURRENT_LIST_DIR}/../../../cmake/modules
 set(build "${WORK}/build")
 set(file "${build}/lib/cmake/llvm/LLVMConfigExtensions.cmake")
 set(other "${WORK}/other.cmake")
+set(deps "${build}/tools/llvm-config/LibraryDependencies.inc")
 
 function(configure extensions)
   execute_process(COMMAND "${CMAKE_COMMAND}" -S "${CMAKE_CURRENT_LIST_DIR}"
@@ -36,14 +39,16 @@ endfunction()
 configure("")
 expect_content("${file}" "set(LLVM_STATIC_EXTENSIONS )")
 file(CREATE_LINK "${file}" "${other}")
-execute_process(COMMAND touch -t 200001010000 "${file}")
+execute_process(COMMAND touch -t 200001010000 "${file}" "${deps}")
 
-# The same content: the file is untouched.
+# The same content: each file is untouched.
 configure("")
-file(TIMESTAMP "${file}" year "%Y")
-if(NOT year STREQUAL "2000")
-  message(SEND_ERROR "${file} was written again with the same content: its time is of ${year}, not 2000.")
-endif()
+foreach(f IN ITEMS "${file}" "${deps}")
+  file(TIMESTAMP "${f}" year "%Y")
+  if(NOT year STREQUAL "2000")
+    message(SEND_ERROR "${f} was written again with the same content: its time is of ${year}, not 2000.")
+  endif()
+endforeach()
 
 # A new content: a new file; the path that shares the old one keeps it.
 configure("Bye")
