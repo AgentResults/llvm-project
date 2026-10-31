@@ -945,7 +945,8 @@ public:
     }
   }
 
-  /// The loaded image dlopen resolves Path to: the one whose name is Path, else the one dlopen gives the same handle for.
+  /// The loaded image dlopen resolves Path to: the one whose name is Path, else the one dlopen gives the same handle for. A
+  /// Path dyld holds no image at is refused with its cause (notLoadedCause), never dyld's words alone, which may be empty.
   Expected<size_t> imageOf(StringRef Path) {
     for (size_t I = 0; I != Images.size(); ++I)
       if (Images[I].Path == Path)
@@ -953,7 +954,7 @@ public:
     std::string P = Path.str();
     void *Handle = dlopen(P.c_str(), RTLD_LAZY | RTLD_NOLOAD);
     if (!Handle)
-      return make_error<StringError>("--dlopen " + Path + ": not a library loaded in this process (" + dlerror() + ")",
+      return make_error<StringError>("--dlopen " + Path + ": not a library loaded in this process - " + notLoadedCause(P),
                                      inconvertibleErrorCode());
     std::optional<size_t> Found;
     for (size_t I = 0; I != Images.size() && !Found; ++I) {
@@ -1065,6 +1066,53 @@ private:
   static std::string dylibName(const MachO::load_command *LC) {
     const auto *D = reinterpret_cast<const MachO::dylib_command *>(LC);
     return std::string(reinterpret_cast<const char *>(LC) + D->dylib.name);
+  }
+
+  /// WHY dyld HOLDS NO IMAGE AT P, read right after its dlopen of P was refused: dyld answers a dlopen of a dylib whose install
+  /// name an image it already holds has WITH THAT IMAGE and maps no second (one image per install name, as its two-level
+  /// namespace binds by install name), so a --dlopen of another build of a library the process holds is "loaded" and still no
+  /// image at its path. The cause names the image the process holds and the file the step names - each a build's place - or
+  /// that dyld holds no image of the file's install name; dyld's own reason follows when it gave one (an empty one is none).
+  std::string notLoadedCause(const std::string &P) {
+    const char *Said = dlerror();
+    std::string Dyld = Said ? Said : "";
+    const std::string Lead = "dlopen(" + P + ", ";
+    if (StringRef(Dyld).starts_with(Lead)) {
+      const size_t Colon = Dyld.find("): ", Lead.size());
+      if (Colon != std::string::npos)
+        Dyld = Dyld.substr(Colon + 3);
+    }
+    Dyld = StringRef(Dyld).trim().str();
+    std::string Cause;
+    auto Buf = MemoryBuffer::getFile(P, /*IsText=*/false, /*RequiresNullTerminator=*/false);
+    if (!Buf) {
+      Cause = "its file cannot be read (" + Buf.getError().message() + ")";
+    } else if ((*Buf)->getBufferSize() < sizeof(MachO::mach_header_64) ||
+               reinterpret_cast<const MachO::mach_header_64 *>((*Buf)->getBufferStart())->magic != MachO::MH_MAGIC_64) {
+      Cause = "its file is no 64-bit Mach-O image";
+    } else {
+      const auto *H = reinterpret_cast<const MachO::mach_header_64 *>((*Buf)->getBufferStart());
+      std::string Install;
+      const bool Read = (*Buf)->getBufferSize() >= sizeof(*H) + H->sizeofcmds && forEachCommand(H, [&](const MachO::load_command *LC) {
+        if (LC->cmd == MachO::LC_ID_DYLIB)
+          Install = dylibName(LC);
+      });
+      if (!Read) {
+        Cause = "its file's load commands are malformed";
+      } else if (Install.empty()) {
+        Cause = "its file is no dylib: it carries no install name";
+      } else {
+        std::optional<size_t> Held;
+        for (size_t I = 0; I != Images.size() && !Held; ++I)
+          if (Images[I].InstallName == Install)
+            Held = I;
+        Cause = Held ? "the process holds " + Install + " at " + Images[*Held].Path + ", and the step names it at " + P +
+                           " - dyld answers a dlopen of an install name it holds with the image it holds and maps no second, so "
+                           "the process's library and the step's are two builds"
+                     : "dyld holds no image of its install name " + Install + " and mapped none at that path";
+      }
+    }
+    return Cause + (Dyld.empty() ? std::string() : " (dyld: " + Dyld + ")");
   }
 
   /// The loaded image of a dylib a load command names: by its install name, else by the name dyld loaded it under.
