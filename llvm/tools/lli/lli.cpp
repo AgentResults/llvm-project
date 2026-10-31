@@ -57,6 +57,7 @@
 #include "llvm/Support/Compiler.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/DynamicLibrary.h"
+#include "llvm/Support/FileSystem.h"
 #include "llvm/Support/Format.h"
 #include "llvm/Support/InitLLVM.h"
 #include "llvm/Support/LLVMDriver.h"
@@ -73,7 +74,10 @@
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/TargetParser/Triple.h"
 #include <cerrno>
+#include <dlfcn.h>
+#include <map>
 #include <optional>
+#include <set>
 
 #if !defined(_MSC_VER) && !defined(__MINGW32__)
 #include <unistd.h>
@@ -887,61 +891,456 @@ static Error loadDylibs() {
   return Error::success();
 }
 
-/// velite: the names a library defines with a strong export of its own, mangled as the JIT looks them up: a Mach-O
-/// library's export trie less its weak definitions (re-exports included, as a static linker reads them), or an ELF
-/// library's defined global dynamic symbols less its weak ones. Any other file is refused, naming it.
-static Expected<orc::SymbolNameSet> strongExportsOf(orc::ExecutionSession &ES,
-                                                    StringRef Path) {
+/// velite: one name a library gives. Strong and Weak are DEFINITIONS, each by the library that defines it (the loaded image's
+/// name); Reexport is no definition: the library only passes the name on from another.
+struct ExportEntry {
+  enum KindT { Strong, Weak, Reexport } Kind;
+  std::string Name;
+  std::string Definer;
+};
+using ExportList = std::vector<ExportEntry>;
+
+#if defined(__APPLE__)
+/// velite: THE INTERFACE OF A LIBRARY IS READ FROM THE IMAGE LOADED IN THIS PROCESS, never from an SDK's copy of it. Every
+/// --dlopen library is dlopen'ed into lli's process (a system framework out of dyld's shared cache included), and each loaded
+/// image carries in memory the export trie dyld itself binds from (LC_DYLD_EXPORTS_TRIE, or LC_DYLD_INFO's export_off): its
+/// __LINKEDIT is at slide + vmaddr - fileoff, for a shared-cache image as for any other (the way dlsym and fishhook read it).
+/// The trie gives each name's flags - weak definition, re-export (the install name of the dylib it comes from, by ordinal),
+/// stub and resolver - and the image's LC_REEXPORT_DYLIB libraries are part of its interface, as dyld searches them. A
+/// library's definer is the image that defines the name, not an umbrella that passes it on.
+extern "C" {
+uint32_t _dyld_image_count(void);
+const char *_dyld_get_image_name(uint32_t);
+const void *_dyld_get_image_header(uint32_t);
+intptr_t _dyld_get_image_vmaddr_slide(uint32_t);
+}
+
+namespace {
+struct Definition {
+  ExportEntry::KindT Kind;
+  std::string Definer;
+};
+using Interface = std::map<std::string, std::vector<Definition>>;
+
+struct LoadedImage {
+  const MachO::mach_header_64 *Header;
+  intptr_t Slide;
+  std::string Path;
+  std::string InstallName;
+};
+
+class LoadedImages {
+public:
+  LoadedImages() {
+    for (uint32_t I = 0, N = _dyld_image_count(); I != N; ++I) {
+      const auto *H = static_cast<const MachO::mach_header_64 *>(_dyld_get_image_header(I));
+      if (!H || H->magic != MachO::MH_MAGIC_64)
+        continue;
+      LoadedImage Img{H, _dyld_get_image_vmaddr_slide(I), _dyld_get_image_name(I), std::string()};
+      forEachCommand(H, [&](const MachO::load_command *LC) {
+        if (LC->cmd == MachO::LC_ID_DYLIB)
+          Img.InstallName = dylibName(LC);
+      });
+      Images.push_back(std::move(Img));
+    }
+  }
+
+  /// The loaded image dlopen resolves Path to: the one whose name is Path, else the one dlopen gives the same handle for.
+  Expected<size_t> imageOf(StringRef Path) {
+    for (size_t I = 0; I != Images.size(); ++I)
+      if (Images[I].Path == Path)
+        return I;
+    std::string P = Path.str();
+    void *Handle = dlopen(P.c_str(), RTLD_LAZY | RTLD_NOLOAD);
+    if (!Handle)
+      return make_error<StringError>("--dlopen " + Path + ": not a library loaded in this process (" + dlerror() + ")",
+                                     inconvertibleErrorCode());
+    std::optional<size_t> Found;
+    for (size_t I = 0; I != Images.size() && !Found; ++I) {
+      void *H = dlopen(Images[I].Path.c_str(), RTLD_LAZY | RTLD_NOLOAD);
+      if (H) {
+        if (H == Handle)
+          Found = I;
+        dlclose(H);
+      }
+    }
+    dlclose(Handle);
+    if (!Found)
+      return make_error<StringError>("--dlopen " + Path + ": loaded, but its image is none of dyld's images",
+                                     inconvertibleErrorCode());
+    return *Found;
+  }
+
+  const std::string &pathOf(size_t I) const { return Images[I].Path; }
+
+  /// The interface of image I: its own export trie and, as dyld searches them, those of its LC_REEXPORT_DYLIB libraries.
+  Expected<const Interface *> interfaceOf(size_t I) {
+    auto Cached = Cache.find(I);
+    if (Cached != Cache.end())
+      return &Cached->second;
+    if (!Active.insert(I).second)
+      return &Empty;
+    const LoadedImage &Img = Images[I];
+    struct Dependent {
+      std::string Name;
+      bool Reexported;
+    };
+    std::vector<Dependent> Dependents;
+    const MachO::segment_command_64 *Linkedit = nullptr;
+    uint32_t TrieOff = 0, TrieSize = 0;
+    bool HaveTrie = false;
+    forEachCommand(Img.Header, [&](const MachO::load_command *LC) {
+      switch (LC->cmd) {
+      case MachO::LC_SEGMENT_64: {
+        const auto *Seg = reinterpret_cast<const MachO::segment_command_64 *>(LC);
+        if (StringRef(Seg->segname, strnlen(Seg->segname, sizeof(Seg->segname))) == "__LINKEDIT")
+          Linkedit = Seg;
+        break;
+      }
+      case MachO::LC_LOAD_DYLIB:
+      case MachO::LC_LOAD_WEAK_DYLIB:
+      case MachO::LC_LOAD_UPWARD_DYLIB:
+      case MachO::LC_LAZY_LOAD_DYLIB:
+        Dependents.push_back({dylibName(LC), false});
+        break;
+      case MachO::LC_REEXPORT_DYLIB:
+        Dependents.push_back({dylibName(LC), true});
+        break;
+      case MachO::LC_DYLD_EXPORTS_TRIE: {
+        const auto *D = reinterpret_cast<const MachO::linkedit_data_command *>(LC);
+        TrieOff = D->dataoff;
+        TrieSize = D->datasize;
+        HaveTrie = true;
+        break;
+      }
+      case MachO::LC_DYLD_INFO:
+      case MachO::LC_DYLD_INFO_ONLY:
+        if (!HaveTrie) {
+          const auto *D = reinterpret_cast<const MachO::dyld_info_command *>(LC);
+          TrieOff = D->export_off;
+          TrieSize = D->export_size;
+          HaveTrie = true;
+        }
+        break;
+      }
+    });
+    Interface Result;
+    auto AddDef = [&](const std::string &Name, Definition Def) {
+      auto &Defs = Result[Name];
+      for (const Definition &D : Defs)
+        if (D.Definer == Def.Definer && D.Kind == Def.Kind)
+          return;
+      Defs.push_back(std::move(Def));
+    };
+    // the libraries it re-exports are searched as part of it
+    for (const Dependent &D : Dependents) {
+      if (!D.Reexported)
+        continue;
+      auto Sub = imageNamed(D.Name);
+      if (!Sub)
+        return Sub.takeError();
+      auto SubIface = interfaceOf(*Sub);
+      if (!SubIface)
+        return SubIface.takeError();
+      for (const auto &[Name, Defs] : **SubIface)
+        for (const Definition &Def : Defs)
+          AddDef(Name, Def);
+    }
+    if (HaveTrie && TrieSize) {
+      if (!Linkedit)
+        return make_error<StringError>(Img.Path + ": has an export trie and no __LINKEDIT segment",
+                                       inconvertibleErrorCode());
+      const uint8_t *Base = reinterpret_cast<const uint8_t *>(Img.Slide + Linkedit->vmaddr - Linkedit->fileoff + TrieOff);
+      Error Err = walkTrie(Base, Base + TrieSize, [&](const std::string &Name, uint64_t Flags, uint64_t Ordinal,
+                                                        const std::string &ImportName) -> Error {
+        if (Flags & MachO::EXPORT_SYMBOL_FLAGS_REEXPORT) {
+          // defined by the dylib this ordinal names: follow it to its loaded image
+          if (Ordinal == 0 || Ordinal > Dependents.size())
+            return make_error<StringError>(Img.Path + ": re-exports " + Name + " from dylib ordinal " + Twine(Ordinal) +
+                                               ", which it has not",
+                                           inconvertibleErrorCode());
+          auto From = imageNamed(Dependents[Ordinal - 1].Name);
+          if (!From)
+            return From.takeError();
+          auto FromIface = interfaceOf(*From);
+          if (!FromIface)
+            return FromIface.takeError();
+          auto Found = (*FromIface)->find(ImportName.empty() ? Name : ImportName);
+          if (Found == (*FromIface)->end())
+            AddDef(Name, {ExportEntry::Reexport, std::string()});
+          else
+            for (const Definition &Def : Found->second)
+              AddDef(Name, Def);
+          return Error::success();
+        }
+        AddDef(Name, {(Flags & MachO::EXPORT_SYMBOL_FLAGS_WEAK_DEFINITION) ? ExportEntry::Weak : ExportEntry::Strong, Img.Path});
+        return Error::success();
+      });
+      if (Err)
+        return std::move(Err);
+    }
+    Active.erase(I);
+    return &(Cache[I] = std::move(Result));
+  }
+
+private:
+  std::vector<LoadedImage> Images;
+  std::map<size_t, Interface> Cache;
+  std::set<size_t> Active;
+  Interface Empty;
+
+  template <typename F> static void forEachCommand(const MachO::mach_header_64 *H, F Fn) {
+    const uint8_t *P = reinterpret_cast<const uint8_t *>(H + 1);
+    for (uint32_t C = 0; C != H->ncmds; ++C) {
+      const auto *LC = reinterpret_cast<const MachO::load_command *>(P);
+      Fn(LC);
+      P += LC->cmdsize;
+    }
+  }
+
+  static std::string dylibName(const MachO::load_command *LC) {
+    const auto *D = reinterpret_cast<const MachO::dylib_command *>(LC);
+    return std::string(reinterpret_cast<const char *>(LC) + D->dylib.name);
+  }
+
+  /// The loaded image of a dylib a load command names: by its install name, else by the name dyld loaded it under.
+  Expected<size_t> imageNamed(const std::string &Name) {
+    for (size_t I = 0; I != Images.size(); ++I)
+      if (Images[I].InstallName == Name)
+        return I;
+    for (size_t I = 0; I != Images.size(); ++I)
+      if (Images[I].Path == Name)
+        return I;
+    return make_error<StringError>("a dylib an image names, " + Name + ", is none of the images loaded in this process",
+                                   inconvertibleErrorCode());
+  }
+
+  static Expected<uint64_t> uleb(const uint8_t *&P, const uint8_t *End) {
+    uint64_t V = 0;
+    unsigned Shift = 0;
+    for (;;) {
+      if (P >= End || Shift > 63)
+        return make_error<StringError>("a malformed export trie", inconvertibleErrorCode());
+      uint8_t B = *P++;
+      V |= uint64_t(B & 0x7f) << Shift;
+      if (!(B & 0x80))
+        return V;
+      Shift += 7;
+    }
+  }
+
+  static Expected<std::string> cstring(const uint8_t *&P, const uint8_t *End) {
+    const uint8_t *S = P;
+    while (P < End && *P)
+      ++P;
+    if (P >= End)
+      return make_error<StringError>("a malformed export trie", inconvertibleErrorCode());
+    std::string R(reinterpret_cast<const char *>(S), P - S);
+    ++P;
+    return R;
+  }
+
+  /// dyld's export trie (mach-o/loader.h, dyld_info_command): a node is a terminal size, the terminal info (flags, then the
+  /// address, stub and resolver offsets, or for a re-export the dylib ordinal and the name it has there), a child count and
+  /// the children (an edge label, the child's offset).
+  template <typename F> static Error walkTrie(const uint8_t *Start, const uint8_t *End, F Emit) {
+    struct Node {
+      uint64_t Offset;
+      std::string Prefix;
+    };
+    std::vector<Node> Stack = {{0, std::string()}};
+    size_t Visited = 0;
+    while (!Stack.empty()) {
+      Node N = std::move(Stack.back());
+      Stack.pop_back();
+      if (N.Offset >= size_t(End - Start) || ++Visited > size_t(End - Start))
+        return make_error<StringError>("a malformed export trie", inconvertibleErrorCode());
+      const uint8_t *P = Start + N.Offset;
+      auto Size = uleb(P, End);
+      if (!Size)
+        return Size.takeError();
+      const uint8_t *After = P + *Size;
+      if (*Size) {
+        auto Flags = uleb(P, End);
+        if (!Flags)
+          return Flags.takeError();
+        uint64_t Ordinal = 0;
+        std::string ImportName;
+        if (*Flags & MachO::EXPORT_SYMBOL_FLAGS_REEXPORT) {
+          auto O = uleb(P, End);
+          if (!O)
+            return O.takeError();
+          Ordinal = *O;
+          auto Imp = cstring(P, End);
+          if (!Imp)
+            return Imp.takeError();
+          ImportName = *Imp;
+        }
+        if (Error E = Emit(N.Prefix, *Flags, Ordinal, ImportName))
+          return E;
+      }
+      P = After;
+      if (P >= End)
+        return make_error<StringError>("a malformed export trie", inconvertibleErrorCode());
+      uint8_t Children = *P++;
+      for (uint8_t C = 0; C != Children; ++C) {
+        auto Edge = cstring(P, End);
+        if (!Edge)
+          return Edge.takeError();
+        auto Off = uleb(P, End);
+        if (!Off)
+          return Off.takeError();
+        Stack.push_back({*Off, N.Prefix + *Edge});
+      }
+    }
+    return Error::success();
+  }
+};
+} // namespace
+
+/// velite: what a --dlopen library gives: the interface of the image loaded in this process.
+static Expected<ExportList> exportsOf(const Triple &, StringRef Path) {
+  static LoadedImages Images;
+  auto Image = Images.imageOf(Path);
+  if (!Image)
+    return Image.takeError();
+  auto Iface = Images.interfaceOf(*Image);
+  if (!Iface)
+    return Iface.takeError();
+  ExportList Names;
+  for (const auto &[Name, Defs] : **Iface)
+    for (const Definition &D : Defs)
+      Names.push_back({D.Kind, Name, D.Definer});
+  return Names;
+}
+#else
+/// velite: what an ELF --dlopen library gives: its defined global dynamic symbols, from its file. Any other file is refused,
+/// naming it.
+static Expected<ExportList> exportsOf(const Triple &, StringRef Path) {
   auto Buf = MemoryBuffer::getFile(Path);
   if (!Buf)
     return createFileError(Path, Buf.getError());
   auto Bin = object::createBinary((*Buf)->getMemBufferRef());
   if (!Bin)
     return createFileError(Path, Bin.takeError());
-  std::unique_ptr<object::MachOObjectFile> Slice;
-  object::MachOObjectFile *MachOFile =
-      dyn_cast<object::MachOObjectFile>(Bin->get());
-  if (auto *Universal = dyn_cast<object::MachOUniversalBinary>(Bin->get())) {
-    auto Obj = Universal->getMachOObjectForArch(
-        ES.getTargetTriple().getArchName());
-    if (!Obj)
-      return createFileError(Path, Obj.takeError());
-    Slice = std::move(*Obj);
-    MachOFile = Slice.get();
-  }
-  orc::SymbolNameSet Names;
-  if (MachOFile) {
-    Error Err = Error::success();
-    for (const object::ExportEntry &E : MachOFile->exports(Err)) {
-      if (E.flags() & MachO::EXPORT_SYMBOL_FLAGS_WEAK_DEFINITION)
-        continue;
-      Names.insert(ES.intern(E.name()));
-    }
-    if (Err)
-      return createFileError(Path, std::move(Err));
-    return Names;
-  }
+  ExportList Names;
   if (auto *Elf = dyn_cast<object::ELFObjectFileBase>(Bin->get())) {
     for (const object::SymbolRef &S : Elf->getDynamicSymbolIterators()) {
       Expected<uint32_t> Flags = S.getFlags();
       if (!Flags)
         return createFileError(Path, Flags.takeError());
-      if ((*Flags & object::SymbolRef::SF_Undefined) ||
-          !(*Flags & object::SymbolRef::SF_Global) ||
-          (*Flags & object::SymbolRef::SF_Weak))
+      if ((*Flags & object::SymbolRef::SF_Undefined) || !(*Flags & object::SymbolRef::SF_Global))
         continue;
       Expected<StringRef> Name = S.getName();
       if (!Name)
         return createFileError(Path, Name.takeError());
-      Names.insert(ES.intern(*Name));
+      Names.push_back({(*Flags & object::SymbolRef::SF_Weak) ? ExportEntry::Weak : ExportEntry::Strong, Name->str(),
+                       Path.str()});
     }
     return Names;
   }
-  return make_error<StringError>(
-      "--dlopen " + Path + ": neither a Mach-O nor an ELF library, so the "
-      "names it defines cannot be read",
-      inconvertibleErrorCode());
+  return make_error<StringError>("--dlopen " + Path + ": not an ELF library, so the names it defines cannot be read",
+                                 inconvertibleErrorCode());
 }
+#endif
+
+/// velite: who gives a name. Owners: the libraries the step gives (and the runtime's two) through which the name can be reached.
+/// Strong: each library that DEFINES it strongly, with the first owner it is reached through; Weak: whether any library defines
+/// it only weakly.
+struct Provider {
+  std::set<unsigned> Owners;
+  std::map<std::string, unsigned> Strong;
+  std::map<std::string, unsigned> WeakDefiners;
+};
+
+/// velite: THE LINK LINE: the libraries the step gives, then the runtime's (libSystem.B, libc++.1), and who gives each name.
+struct LinkLine {
+  std::vector<std::string> Libraries;
+  StringMap<Provider> Names;
+
+  /// The library a name binds to, by the rule of dyld: the one library that defines it strongly; with none, the weak
+  /// definitions coalesce to one definition, the one dyld bound (dyld weak-def coalescing); a name
+  /// two libraries define strongly binds to none (it is AmbiguousImport). A name no library gives binds to none.
+  std::optional<unsigned> bindingOf(StringRef Name) const {
+    auto It = Names.find(Name);
+    if (It == Names.end() || It->second.Strong.size() > 1)
+      return std::nullopt;
+    if (It->second.Strong.size() == 1)
+      return It->second.Strong.begin()->second;
+    // no strong definition: the weak ones coalesce to the one dyld bound, whose image gave the process's own address for the name
+    if (It->second.WeakDefiners.size() > 1 && Name.size() > 1) {
+      if (void *Addr = dlsym(RTLD_DEFAULT, Name.str().c_str() + 1)) {
+        Dl_info Info;
+        if (dladdr(Addr, &Info) && Info.dli_fname) {
+          auto Canonical = It->second.WeakDefiners.find(Info.dli_fname);
+          if (Canonical != It->second.WeakDefiners.end())
+            return Canonical->second;
+        }
+      }
+    }
+    return *It->second.Owners.begin();
+  }
+
+  void add(unsigned Owner, const ExportList &Exports) {
+    for (const ExportEntry &E : Exports) {
+      Provider &P = Names[E.Name];
+      P.Owners.insert(Owner);
+      if (E.Kind == ExportEntry::Strong)
+        P.Strong.emplace(E.Definer, Owner);
+      else if (E.Kind == ExportEntry::Weak)
+        P.WeakDefiners.emplace(E.Definer, Owner);
+    }
+  }
+};
+
+/// velite: refuses a lookup of a name that more than one library defines strongly: AmbiguousImport, naming the symbol and each
+/// defining library with the library the step gave it through, for no order of --dlopen decides a binding.
+class AmbiguousImportGuard : public orc::DefinitionGenerator {
+public:
+  AmbiguousImportGuard(std::shared_ptr<LinkLine> Line) : Line(std::move(Line)) {}
+  Error tryToGenerate(orc::LookupState &, orc::LookupKind, orc::JITDylib &, orc::JITDylibLookupFlags,
+                      const orc::SymbolLookupSet &Symbols) override {
+    for (const auto &KV : Symbols) {
+      auto It = Line->Names.find(*KV.first);
+      if (It == Line->Names.end() || It->second.Strong.size() < 2)
+        continue;
+      std::string Libs;
+      for (const auto &[Definer, Owner] : It->second.Strong)
+        Libs += (Libs.empty() ? "" : "; ") + Definer + " (given as " + Line->Libraries[Owner] + ")";
+      return make_error<StringError>("AmbiguousImport: " + (*KV.first).str() + " is defined strongly by more than one "
+                                         "library: " + Libs,
+                                     inconvertibleErrorCode());
+    }
+    return Error::success();
+  }
+
+private:
+  std::shared_ptr<LinkLine> Line;
+};
+
+/// velite: the last of every search: a name still unresolved when it is asked has no library that gives it - UnresolvedImport,
+/// naming the symbol and the libraries checked. A weak reference stays unresolved (null), as a linker leaves it.
+class UnresolvedImportGuard : public orc::DefinitionGenerator {
+public:
+  UnresolvedImportGuard(std::shared_ptr<LinkLine> Line) : Line(std::move(Line)) {}
+  Error tryToGenerate(orc::LookupState &, orc::LookupKind, orc::JITDylib &, orc::JITDylibLookupFlags,
+                      const orc::SymbolLookupSet &Symbols) override {
+    for (const auto &KV : Symbols) {
+      if (KV.second == orc::SymbolLookupFlags::WeaklyReferencedSymbol)
+        continue;
+      std::string Libs;
+      for (const std::string &L : Line->Libraries)
+        Libs += (Libs.empty() ? "" : ", ") + L;
+      return make_error<StringError>("UnresolvedImport: " + (*KV.first).str() + ": no library the step gives exports it "
+                                         "(checked: " + Libs + ")",
+                                     inconvertibleErrorCode());
+    }
+    return Error::success();
+  }
+
+private:
+  std::shared_ptr<LinkLine> Line;
+};
 
 static void exitOnLazyCallThroughFailure() { exit(1); }
 
@@ -1118,21 +1517,56 @@ static int runOrcJIT(const char *ProgName) {
     break;
   }
 
+  // velite: THE --dlopen LIBRARIES ARE THE PROGRAM'S LINK LINE, AND NO ORDER DECIDES A BINDING. Each library has an interface
+  // read from its image loaded in this process - the export trie dyld itself binds from - and the process's own runtime
+  // (libSystem.B, libc++.1) is two more libraries of the line, read the same way. An
+  // undefined symbol of the program binds to the one library that defines it strongly (AmbiguousImport when two do);
+  // with no strong definition the weak definitions coalesce to one, as dyld does (dyld weak-def coalescing); a name no
+  // library gives is UnresolvedImport. Every address comes from its own library's handle. Searched through the process's
+  // global namespace, an import bound to whichever image happened to define the name first - on macOS the system's LibreSSL
+  // libcrypto (mapped under CoreServices) outranked the OpenSSL the program was given. The table is read before the JIT is
+  // created: the platform's bootstrap links the ORC runtime against it.
+  auto Line = std::make_shared<LinkLine>();
+  const Triple &LinkTT = Builder.getJITTargetMachineBuilder()->getTargetTriple();
+  const bool Darwin = LinkTT.isOSDarwin();
+  const char *RuntimeLibraries[] = {"/usr/lib/libSystem.B.dylib", "/usr/lib/libc++.1.dylib"};
+  for (const auto &Dylib : Dylibs) {
+    Line->Libraries.push_back(Dylib);
+    Line->add(Line->Libraries.size() - 1, ExitOnErr(exportsOf(LinkTT, Dylib)));
+  }
+  const unsigned FirstRuntime = Line->Libraries.size();
+  if (Darwin)
+    for (const char *Runtime : RuntimeLibraries) {
+      Line->Libraries.push_back(Runtime);
+      Line->add(Line->Libraries.size() - 1, ExitOnErr(exportsOf(LinkTT, Runtime)));
+    }
+  if (Darwin)
+    Builder.setProcessSymbolsJITDylibSetup(
+        [Line, FirstRuntime, RuntimeLibraries](orc::LLJIT &L) -> Expected<orc::JITDylibSP> {
+          auto &PJD = L.getExecutionSession().createBareJITDylib("<Process Symbols>");
+          for (unsigned I = 0; I != 2; ++I) {
+            auto G = orc::EPCDynamicLibrarySearchGenerator::Load(
+                L.getExecutionSession(), L.getDylibMgr(), RuntimeLibraries[I],
+                [Line, Idx = FirstRuntime + I](const orc::SymbolStringPtr &Name) {
+                  return Line->bindingOf(*Name) == std::optional<unsigned>(Idx);
+                });
+            if (!G)
+              return G.takeError();
+            PJD.addGenerator(std::move(*G));
+          }
+          // generators are tried in the order they were added (Core.cpp: CurDefGeneratorStack is the reverse of
+          // DefGenerators, popped from its back): this one, the last, answers what none before it gave
+          PJD.addGenerator(std::make_unique<UnresolvedImportGuard>(Line));
+          return &PJD;
+        });
+
   auto J = ExitOnErr(Builder.create());
 
-  // velite: THE --dlopen LIBRARIES ARE THE PROGRAM'S LINK LINE. An undefined symbol of the program binds to the first of
-  // them, in their order, that defines it with a strong export of its own - as a static linker binds an import to a
-  // library its link line names, and as dyld binds a two-level import to that library - and only then to an image the
-  // process holds otherwise (libSystem, libc++). A weak definition is not bound here: dyld coalesces it across the
-  // process, so it stays the process's choice. Searched only through the process's global namespace, an import bound to
-  // whichever image happened to define the name first - on macOS, the system's LibreSSL libcrypto (mapped under
-  // CoreServices) outranked the OpenSSL the program was given, and a program's X509_new was LibreSSL's.
-  for (const auto &Dylib : Dylibs) {
-    orc::SymbolNameSet Strong = ExitOnErr(strongExportsOf(J->getExecutionSession(), Dylib));
+  J->getMainJITDylib().addGenerator(std::make_unique<AmbiguousImportGuard>(Line));
+  for (unsigned I = 0; I != Dylibs.size(); ++I)
     J->getMainJITDylib().addGenerator(ExitOnErr(orc::EPCDynamicLibrarySearchGenerator::Load(
-        J->getExecutionSession(), J->getDylibMgr(), Dylib.c_str(),
-        [Strong = std::move(Strong)](const orc::SymbolStringPtr &Name) { return Strong.count(Name) != 0; })));
-  }
+        J->getExecutionSession(), J->getDylibMgr(), Dylibs[I].c_str(),
+        [Line, I](const orc::SymbolStringPtr &Name) { return Line->bindingOf(*Name) == std::optional<unsigned>(I); })));
 
   auto *ObjLayer = &J->getObjLinkingLayer();
   if (auto *RTDyldObjLayer = dyn_cast<orc::RTDyldObjectLinkingLayer>(ObjLayer)) {
