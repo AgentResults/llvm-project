@@ -49,6 +49,9 @@
 #include "llvm/IR/Verifier.h"
 #include "llvm/IRReader/IRReader.h"
 #include "llvm/Object/Archive.h"
+#include "llvm/Object/ELFObjectFile.h"
+#include "llvm/Object/MachO.h"
+#include "llvm/Object/MachOUniversal.h"
 #include "llvm/Object/ObjectFile.h"
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/Compiler.h"
@@ -884,6 +887,62 @@ static Error loadDylibs() {
   return Error::success();
 }
 
+/// velite: the names a library defines with a strong export of its own, mangled as the JIT looks them up: a Mach-O
+/// library's export trie less its weak definitions (re-exports included, as a static linker reads them), or an ELF
+/// library's defined global dynamic symbols less its weak ones. Any other file is refused, naming it.
+static Expected<orc::SymbolNameSet> strongExportsOf(orc::ExecutionSession &ES,
+                                                    StringRef Path) {
+  auto Buf = MemoryBuffer::getFile(Path);
+  if (!Buf)
+    return createFileError(Path, Buf.getError());
+  auto Bin = object::createBinary((*Buf)->getMemBufferRef());
+  if (!Bin)
+    return createFileError(Path, Bin.takeError());
+  std::unique_ptr<object::MachOObjectFile> Slice;
+  object::MachOObjectFile *MachOFile =
+      dyn_cast<object::MachOObjectFile>(Bin->get());
+  if (auto *Universal = dyn_cast<object::MachOUniversalBinary>(Bin->get())) {
+    auto Obj = Universal->getMachOObjectForArch(
+        ES.getTargetTriple().getArchName());
+    if (!Obj)
+      return createFileError(Path, Obj.takeError());
+    Slice = std::move(*Obj);
+    MachOFile = Slice.get();
+  }
+  orc::SymbolNameSet Names;
+  if (MachOFile) {
+    Error Err = Error::success();
+    for (const object::ExportEntry &E : MachOFile->exports(Err)) {
+      if (E.flags() & MachO::EXPORT_SYMBOL_FLAGS_WEAK_DEFINITION)
+        continue;
+      Names.insert(ES.intern(E.name()));
+    }
+    if (Err)
+      return createFileError(Path, std::move(Err));
+    return Names;
+  }
+  if (auto *Elf = dyn_cast<object::ELFObjectFileBase>(Bin->get())) {
+    for (const object::SymbolRef &S : Elf->getDynamicSymbolIterators()) {
+      Expected<uint32_t> Flags = S.getFlags();
+      if (!Flags)
+        return createFileError(Path, Flags.takeError());
+      if ((*Flags & object::SymbolRef::SF_Undefined) ||
+          !(*Flags & object::SymbolRef::SF_Global) ||
+          (*Flags & object::SymbolRef::SF_Weak))
+        continue;
+      Expected<StringRef> Name = S.getName();
+      if (!Name)
+        return createFileError(Path, Name.takeError());
+      Names.insert(ES.intern(*Name));
+    }
+    return Names;
+  }
+  return make_error<StringError>(
+      "--dlopen " + Path + ": neither a Mach-O nor an ELF library, so the "
+      "names it defines cannot be read",
+      inconvertibleErrorCode());
+}
+
 static void exitOnLazyCallThroughFailure() { exit(1); }
 
 static Expected<orc::ThreadSafeModule>
@@ -1060,6 +1119,20 @@ static int runOrcJIT(const char *ProgName) {
   }
 
   auto J = ExitOnErr(Builder.create());
+
+  // velite: THE --dlopen LIBRARIES ARE THE PROGRAM'S LINK LINE. An undefined symbol of the program binds to the first of
+  // them, in their order, that defines it with a strong export of its own - as a static linker binds an import to a
+  // library its link line names, and as dyld binds a two-level import to that library - and only then to an image the
+  // process holds otherwise (libSystem, libc++). A weak definition is not bound here: dyld coalesces it across the
+  // process, so it stays the process's choice. Searched only through the process's global namespace, an import bound to
+  // whichever image happened to define the name first - on macOS, the system's LibreSSL libcrypto (mapped under
+  // CoreServices) outranked the OpenSSL the program was given, and a program's X509_new was LibreSSL's.
+  for (const auto &Dylib : Dylibs) {
+    orc::SymbolNameSet Strong = ExitOnErr(strongExportsOf(J->getExecutionSession(), Dylib));
+    J->getMainJITDylib().addGenerator(ExitOnErr(orc::EPCDynamicLibrarySearchGenerator::Load(
+        J->getExecutionSession(), J->getDylibMgr(), Dylib.c_str(),
+        [Strong = std::move(Strong)](const orc::SymbolStringPtr &Name) { return Strong.count(Name) != 0; })));
+  }
 
   auto *ObjLayer = &J->getObjLinkingLayer();
   if (auto *RTDyldObjLayer = dyn_cast<orc::RTDyldObjectLinkingLayer>(ObjLayer)) {
