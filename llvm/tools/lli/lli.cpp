@@ -57,6 +57,7 @@
 #include "llvm/Support/Compiler.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/DynamicLibrary.h"
+#include "llvm/Support/FileSystem.h"
 #include "llvm/Support/Format.h"
 #include "llvm/Support/InitLLVM.h"
 #include "llvm/Support/LLVMDriver.h"
@@ -72,8 +73,14 @@
 #include "llvm/Support/WithColor.h"
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/TargetParser/Triple.h"
+#include "llvm/TextAPI/Architecture.h"
+#include "llvm/TextAPI/InterfaceFile.h"
+#include "llvm/TextAPI/Platform.h"
+#include "llvm/TextAPI/TextAPIReader.h"
 #include <cerrno>
+#include <map>
 #include <optional>
+#include <set>
 
 #if !defined(_MSC_VER) && !defined(__MINGW32__)
 #include <unistd.h>
@@ -90,6 +97,8 @@
 
 #if defined(__APPLE__)
 #include <crt_externs.h>
+// <mach-o/dyld.h> defines macros that name llvm::MachO enumerators; this one function of it is declared here
+extern "C" bool _dyld_shared_cache_contains_path(const char *path);
 #else
 extern "C" char **environ;
 #endif
@@ -160,6 +169,12 @@ static cl::list<std::string>
 
 static cl::list<std::string>
     Dylibs("dlopen", cl::desc("Dynamic libraries to load before linking"));
+
+// velite: the SDK whose text stubs (.tbd) state the interface of a --dlopen library that only dyld's shared cache holds
+// (macOS 11 and later keep the system's frameworks and libraries nowhere else), as ld64 reads it from the SDK
+static cl::opt<std::string>
+    SDKRoot("sdk", cl::value_desc("path"),
+            cl::desc("The SDK whose text stubs give the interface of a --dlopen library that only dyld's shared cache holds"));
 
 // The MCJIT supports building for a target address space separate from
 // the JIT compilation process. Use a forked process and a copying
@@ -887,11 +902,144 @@ static Error loadDylibs() {
   return Error::success();
 }
 
-/// velite: the names a library defines with a strong export of its own, mangled as the JIT looks them up: a Mach-O
-/// library's export trie less its weak definitions (re-exports included, as a static linker reads them), or an ELF
-/// library's defined global dynamic symbols less its weak ones. Any other file is refused, naming it.
-static Expected<orc::SymbolNameSet> strongExportsOf(orc::ExecutionSession &ES,
-                                                    StringRef Path) {
+/// velite: one name a library gives. Strong and Weak are DEFINITIONS, each by the library that defines it (the file itself, or
+/// for a system library the install name of the stub that defines it). Reexport is no definition: the library only passes the
+/// name on from another, so it says through which library the name can be reached and never who defines it.
+struct ExportEntry {
+  enum KindT { Strong, Weak, Reexport } Kind;
+  std::string Name;
+  std::string Definer;
+};
+using ExportList = std::vector<ExportEntry>;
+
+/// velite: a system library's text stub in the SDK (--sdk) for its install name: the SDK's path joined to the install name with
+/// `.tbd` added (a framework: X.framework/X.tbd) or in place of `.dylib` (/usr/lib/libY.tbd), as ld64 finds it. None found
+/// refuses, naming the install name and every path looked in.
+static Expected<std::unique_ptr<MachO::InterfaceFile>> readSDKStub(StringRef InstallName) {
+  SmallVector<std::string, 2> Candidates;
+  Candidates.push_back(SDKRoot + InstallName.str() + ".tbd");
+  if (InstallName.ends_with(".dylib"))
+    Candidates.push_back(SDKRoot + InstallName.drop_back(6).str() + ".tbd");
+  for (const std::string &C : Candidates)
+    if (sys::fs::exists(C)) {
+      auto Buf = MemoryBuffer::getFile(C);
+      if (!Buf)
+        return createFileError(C, Buf.getError());
+      auto IF = MachO::TextAPIReader::get((*Buf)->getMemBufferRef());
+      if (!IF)
+        return createFileError(C, IF.takeError());
+      return std::move(*IF);
+    }
+  std::string Looked;
+  for (const std::string &C : Candidates)
+    Looked += (Looked.empty() ? "" : ", ") + C;
+  return make_error<StringError>(InstallName + ": a library of dyld's shared cache only, and its text stub is in none of: " +
+                                     Looked + " (--sdk " + SDKRoot + ")",
+                                 inconvertibleErrorCode());
+}
+
+/// velite: what a system library only dyld's shared cache holds gives, read from the SDK's text stub for its install name with
+/// TextAPI, as ld64 reads it (prior art llvm-jitlink's getDylibInterfaceFromTapiFile). Each stub is read for the target the
+/// text is compiled for: its architecture (arm64 code links the arm64e slice when there is no arm64 one, as ORC's
+/// standardMachOFallbackArchs does) and its platform. The libraries a stub re-exports are followed to the library that
+/// defines each name: an inlined document of the stub, or else their own stub in the SDK; a symbol a stub only re-exports is a
+/// Reexport, never a definition.
+static Expected<ExportList> exportsOfSystemLibrary(const Triple &TT, StringRef InstallName) {
+  if (SDKRoot.empty())
+    return make_error<StringError>("--dlopen " + InstallName + ": a library of dyld's shared cache only, whose interface is "
+                                       "its text stub in an SDK, and no --sdk was given",
+                                   inconvertibleErrorCode());
+  const MachO::Architecture Arch0 = MachO::mapToArchitecture(TT);
+  // the JIT's triple names the OS `darwin` (arm64-apple-darwin25.5.0), which TextAPI maps to no platform: it is macOS
+  const MachO::PlatformType Platform =
+      (TT.getOS() == Triple::Darwin || TT.isMacOSX()) ? MachO::PLATFORM_MACOS : MachO::mapToPlatformType(TT);
+  SmallVector<MachO::Architecture, 2> Archs = {Arch0};
+  if (Arch0 == MachO::AK_arm64)
+    Archs.push_back(MachO::AK_arm64e);
+  auto Root = readSDKStub(InstallName);
+  if (!Root)
+    return Root.takeError();
+  ExportList Names;
+  std::vector<std::unique_ptr<MachO::InterfaceFile>> Read;
+  std::set<std::string> Visited = {(*Root)->getInstallName().str()};
+  SmallVector<const MachO::InterfaceFile *, 16> Queue = {Root->get()};
+  for (size_t Q = 0; Q != Queue.size(); ++Q) {
+    const MachO::InterfaceFile *File = Queue[Q];
+    std::optional<MachO::Architecture> Arch;
+    for (MachO::Architecture A : Archs)
+      if (File->getArchitectures().has(A)) {
+        Arch = A;
+        break;
+      }
+    if (!Arch) {
+      if (Q == 0)
+        return make_error<StringError>("--dlopen " + InstallName + ": its text stub has no slice for " + TT.str(),
+                                       inconvertibleErrorCode());
+      continue;
+    }
+    const MachO::Target Want(*Arch, Platform);
+    const std::string Definer = File->getInstallName().str();
+    for (const MachO::Symbol *Sym : File->symbols()) {
+      if (Sym->isUndefined() || !Sym->hasTarget(Want))
+        continue;
+      const ExportEntry::KindT Kind = Sym->isReexported()     ? ExportEntry::Reexport
+                                      : Sym->isWeakDefined() ? ExportEntry::Weak
+                                                             : ExportEntry::Strong;
+      const std::string Name = Sym->getName().str();
+      auto Add = [&](std::string N) { Names.push_back({Kind, std::move(N), Definer}); };
+      switch (Sym->getKind()) {
+      case MachO::EncodeKind::GlobalSymbol:
+        Add(Name);
+        break;
+      case MachO::EncodeKind::ObjectiveCClass:
+        Add(MachO::ObjC2ClassNamePrefix.str() + Name);
+        Add(MachO::ObjC2MetaClassNamePrefix.str() + Name);
+        break;
+      case MachO::EncodeKind::ObjectiveCClassEHType:
+        Add(MachO::ObjC2EHTypePrefix.str() + Name);
+        break;
+      case MachO::EncodeKind::ObjectiveCInstanceVariable:
+        Add(MachO::ObjC2IVarPrefix.str() + Name);
+        break;
+      }
+    }
+    for (const MachO::InterfaceFileRef &Ref : File->reexportedLibraries()) {
+      const std::string Re = Ref.getInstallName().str();
+      if (!Visited.insert(Re).second)
+        continue;
+      const MachO::InterfaceFile *Next = nullptr;
+      for (const auto &Doc : (*Root)->documents())
+        if (Doc->getInstallName() == Re)
+          Next = Doc.get();
+      if (!Next) {
+        auto Stub = readSDKStub(Re);
+        if (!Stub)
+          return Stub.takeError();
+        Read.push_back(std::move(*Stub));
+        Next = Read.back().get();
+      }
+      Queue.push_back(Next);
+    }
+  }
+  return Names;
+}
+
+/// velite: a --dlopen path that is no file on disk but is in dyld's shared cache (macOS 11 and later)
+static bool inDyldSharedCacheOnly(StringRef Path) {
+#if defined(__APPLE__)
+  std::string P = Path.str();
+  return !sys::fs::exists(P) && _dyld_shared_cache_contains_path(P.c_str());
+#else
+  return false;
+#endif
+}
+
+/// velite: what a --dlopen library gives, from its owner in place: a Mach-O library's export trie, an ELF library's defined
+/// global dynamic symbols, a system library only dyld's shared cache holds its text stub in the SDK. Any other file is
+/// refused, naming it.
+static Expected<ExportList> exportsOf(const Triple &TT, StringRef Path) {
+  if (inDyldSharedCacheOnly(Path))
+    return exportsOfSystemLibrary(TT, Path);
   auto Buf = MemoryBuffer::getFile(Path);
   if (!Buf)
     return createFileError(Path, Buf.getError());
@@ -902,20 +1050,20 @@ static Expected<orc::SymbolNameSet> strongExportsOf(orc::ExecutionSession &ES,
   object::MachOObjectFile *MachOFile =
       dyn_cast<object::MachOObjectFile>(Bin->get());
   if (auto *Universal = dyn_cast<object::MachOUniversalBinary>(Bin->get())) {
-    auto Obj = Universal->getMachOObjectForArch(
-        ES.getTargetTriple().getArchName());
+    auto Obj = Universal->getMachOObjectForArch(TT.getArchName());
     if (!Obj)
       return createFileError(Path, Obj.takeError());
     Slice = std::move(*Obj);
     MachOFile = Slice.get();
   }
-  orc::SymbolNameSet Names;
+  ExportList Names;
   if (MachOFile) {
     Error Err = Error::success();
     for (const object::ExportEntry &E : MachOFile->exports(Err)) {
-      if (E.flags() & MachO::EXPORT_SYMBOL_FLAGS_WEAK_DEFINITION)
-        continue;
-      Names.insert(ES.intern(E.name()));
+      const ExportEntry::KindT Kind = (E.flags() & MachO::EXPORT_SYMBOL_FLAGS_REEXPORT)          ? ExportEntry::Reexport
+                                      : (E.flags() & MachO::EXPORT_SYMBOL_FLAGS_WEAK_DEFINITION) ? ExportEntry::Weak
+                                                                                                  : ExportEntry::Strong;
+      Names.push_back({Kind, E.name().str(), Path.str()});
     }
     if (Err)
       return createFileError(Path, std::move(Err));
@@ -927,13 +1075,13 @@ static Expected<orc::SymbolNameSet> strongExportsOf(orc::ExecutionSession &ES,
       if (!Flags)
         return createFileError(Path, Flags.takeError());
       if ((*Flags & object::SymbolRef::SF_Undefined) ||
-          !(*Flags & object::SymbolRef::SF_Global) ||
-          (*Flags & object::SymbolRef::SF_Weak))
+          !(*Flags & object::SymbolRef::SF_Global))
         continue;
       Expected<StringRef> Name = S.getName();
       if (!Name)
         return createFileError(Path, Name.takeError());
-      Names.insert(ES.intern(*Name));
+      Names.push_back({(*Flags & object::SymbolRef::SF_Weak) ? ExportEntry::Weak : ExportEntry::Strong, Name->str(),
+                       Path.str()});
     }
     return Names;
   }
@@ -942,6 +1090,93 @@ static Expected<orc::SymbolNameSet> strongExportsOf(orc::ExecutionSession &ES,
       "names it defines cannot be read",
       inconvertibleErrorCode());
 }
+
+/// velite: who gives a name. Owners: the libraries the step gives (and the runtime's two) through which the name can be reached.
+/// Strong: each library that DEFINES it strongly, with the first owner it is reached through; Weak: whether any library defines
+/// it only weakly.
+struct Provider {
+  std::set<unsigned> Owners;
+  std::map<std::string, unsigned> Strong;
+  bool Weak = false;
+};
+
+/// velite: THE LINK LINE: the libraries the step gives, then the runtime's (libSystem.B, libc++.1), and who gives each name.
+struct LinkLine {
+  std::vector<std::string> Libraries;
+  StringMap<Provider> Names;
+
+  /// The library a name binds to, by the rule of dyld: the one library that defines it strongly; with none, the weak
+  /// definitions coalesce to one definition, dyld's (the first image of the link line that gives it, in load order); a name
+  /// two libraries define strongly binds to none (it is AmbiguousImport). A name no library gives binds to none.
+  std::optional<unsigned> bindingOf(StringRef Name) const {
+    auto It = Names.find(Name);
+    if (It == Names.end() || It->second.Strong.size() > 1)
+      return std::nullopt;
+    if (It->second.Strong.size() == 1)
+      return It->second.Strong.begin()->second;
+    return *It->second.Owners.begin();
+  }
+
+  void add(unsigned Owner, const ExportList &Exports) {
+    for (const ExportEntry &E : Exports) {
+      Provider &P = Names[E.Name];
+      P.Owners.insert(Owner);
+      if (E.Kind == ExportEntry::Strong)
+        P.Strong.emplace(E.Definer, Owner);
+      else if (E.Kind == ExportEntry::Weak)
+        P.Weak = true;
+    }
+  }
+};
+
+/// velite: refuses a lookup of a name that more than one library defines strongly: AmbiguousImport, naming the symbol and each
+/// defining library with the library the step gave it through, for no order of --dlopen decides a binding.
+class AmbiguousImportGuard : public orc::DefinitionGenerator {
+public:
+  AmbiguousImportGuard(std::shared_ptr<LinkLine> Line) : Line(std::move(Line)) {}
+  Error tryToGenerate(orc::LookupState &, orc::LookupKind, orc::JITDylib &, orc::JITDylibLookupFlags,
+                      const orc::SymbolLookupSet &Symbols) override {
+    for (const auto &KV : Symbols) {
+      auto It = Line->Names.find(*KV.first);
+      if (It == Line->Names.end() || It->second.Strong.size() < 2)
+        continue;
+      std::string Libs;
+      for (const auto &[Definer, Owner] : It->second.Strong)
+        Libs += (Libs.empty() ? "" : "; ") + Definer + " (given as " + Line->Libraries[Owner] + ")";
+      return make_error<StringError>("AmbiguousImport: " + (*KV.first).str() + " is defined strongly by more than one "
+                                         "library: " + Libs,
+                                     inconvertibleErrorCode());
+    }
+    return Error::success();
+  }
+
+private:
+  std::shared_ptr<LinkLine> Line;
+};
+
+/// velite: the last of every search: a name still unresolved when it is asked has no library that gives it - UnresolvedImport,
+/// naming the symbol and the libraries checked. A weak reference stays unresolved (null), as a linker leaves it.
+class UnresolvedImportGuard : public orc::DefinitionGenerator {
+public:
+  UnresolvedImportGuard(std::shared_ptr<LinkLine> Line) : Line(std::move(Line)) {}
+  Error tryToGenerate(orc::LookupState &, orc::LookupKind, orc::JITDylib &, orc::JITDylibLookupFlags,
+                      const orc::SymbolLookupSet &Symbols) override {
+    for (const auto &KV : Symbols) {
+      if (KV.second == orc::SymbolLookupFlags::WeaklyReferencedSymbol)
+        continue;
+      std::string Libs;
+      for (const std::string &L : Line->Libraries)
+        Libs += (Libs.empty() ? "" : ", ") + L;
+      return make_error<StringError>("UnresolvedImport: " + (*KV.first).str() + ": no library the step gives exports it "
+                                         "(checked: " + Libs + ")",
+                                     inconvertibleErrorCode());
+    }
+    return Error::success();
+  }
+
+private:
+  std::shared_ptr<LinkLine> Line;
+};
 
 static void exitOnLazyCallThroughFailure() { exit(1); }
 
@@ -1118,21 +1353,61 @@ static int runOrcJIT(const char *ProgName) {
     break;
   }
 
+  // velite: THE --dlopen LIBRARIES ARE THE PROGRAM'S LINK LINE, AND NO ORDER DECIDES A BINDING. Each library has an interface
+  // read from its owner in place - a laid file's export trie, or a system library's text stub in the SDK (--sdk), as ld64
+  // reads it - and the process's own runtime (libSystem.B, libc++.1) is two more libraries of the line, by their stubs. An
+  // undefined symbol of the program binds to the one library that defines it strongly (AmbiguousImport when two do);
+  // with no strong definition the weak definitions coalesce to one, as dyld does (dyld weak-def coalescing); a name no
+  // library gives is UnresolvedImport. Every address comes from its own library's handle. Searched through the process's
+  // global namespace, an import bound to whichever image happened to define the name first - on macOS the system's LibreSSL
+  // libcrypto (mapped under CoreServices) outranked the OpenSSL the program was given. The table is read before the JIT is
+  // created: the platform's bootstrap links the ORC runtime against it.
+  auto Line = std::make_shared<LinkLine>();
+  const Triple &LinkTT = Builder.getJITTargetMachineBuilder()->getTargetTriple();
+  const bool Darwin = LinkTT.isOSDarwin();
+  const char *RuntimeLibraries[] = {"/usr/lib/libSystem.B.dylib", "/usr/lib/libc++.1.dylib"};
+  if (Darwin && SDKRoot.empty())
+    ExitOnErr(make_error<StringError>("--sdk is required on Darwin: the process's runtime (libSystem, libc++) is bound by "
+                                      "its interface in the SDK the program is compiled against, never by whatever image "
+                                      "the process holds",
+                                      inconvertibleErrorCode()));
+  for (const auto &Dylib : Dylibs) {
+    Line->Libraries.push_back(Dylib);
+    Line->add(Line->Libraries.size() - 1, ExitOnErr(exportsOf(LinkTT, Dylib)));
+  }
+  const unsigned FirstRuntime = Line->Libraries.size();
+  if (Darwin)
+    for (const char *Runtime : RuntimeLibraries) {
+      Line->Libraries.push_back(Runtime);
+      Line->add(Line->Libraries.size() - 1, ExitOnErr(exportsOfSystemLibrary(LinkTT, Runtime)));
+    }
+  if (Darwin)
+    Builder.setProcessSymbolsJITDylibSetup(
+        [Line, FirstRuntime, RuntimeLibraries](orc::LLJIT &L) -> Expected<orc::JITDylibSP> {
+          auto &PJD = L.getExecutionSession().createBareJITDylib("<Process Symbols>");
+          for (unsigned I = 0; I != 2; ++I) {
+            auto G = orc::EPCDynamicLibrarySearchGenerator::Load(
+                L.getExecutionSession(), L.getDylibMgr(), RuntimeLibraries[I],
+                [Line, Idx = FirstRuntime + I](const orc::SymbolStringPtr &Name) {
+                  return Line->bindingOf(*Name) == std::optional<unsigned>(Idx);
+                });
+            if (!G)
+              return G.takeError();
+            PJD.addGenerator(std::move(*G));
+          }
+          // generators are tried in the order they were added (Core.cpp: CurDefGeneratorStack is the reverse of
+          // DefGenerators, popped from its back): this one, the last, answers what none before it gave
+          PJD.addGenerator(std::make_unique<UnresolvedImportGuard>(Line));
+          return &PJD;
+        });
+
   auto J = ExitOnErr(Builder.create());
 
-  // velite: THE --dlopen LIBRARIES ARE THE PROGRAM'S LINK LINE. An undefined symbol of the program binds to the first of
-  // them, in their order, that defines it with a strong export of its own - as a static linker binds an import to a
-  // library its link line names, and as dyld binds a two-level import to that library - and only then to an image the
-  // process holds otherwise (libSystem, libc++). A weak definition is not bound here: dyld coalesces it across the
-  // process, so it stays the process's choice. Searched only through the process's global namespace, an import bound to
-  // whichever image happened to define the name first - on macOS, the system's LibreSSL libcrypto (mapped under
-  // CoreServices) outranked the OpenSSL the program was given, and a program's X509_new was LibreSSL's.
-  for (const auto &Dylib : Dylibs) {
-    orc::SymbolNameSet Strong = ExitOnErr(strongExportsOf(J->getExecutionSession(), Dylib));
+  J->getMainJITDylib().addGenerator(std::make_unique<AmbiguousImportGuard>(Line));
+  for (unsigned I = 0; I != Dylibs.size(); ++I)
     J->getMainJITDylib().addGenerator(ExitOnErr(orc::EPCDynamicLibrarySearchGenerator::Load(
-        J->getExecutionSession(), J->getDylibMgr(), Dylib.c_str(),
-        [Strong = std::move(Strong)](const orc::SymbolStringPtr &Name) { return Strong.count(Name) != 0; })));
-  }
+        J->getExecutionSession(), J->getDylibMgr(), Dylibs[I].c_str(),
+        [Line, I](const orc::SymbolStringPtr &Name) { return Line->bindingOf(*Name) == std::optional<unsigned>(I); })));
 
   auto *ObjLayer = &J->getObjLinkingLayer();
   if (auto *RTDyldObjLayer = dyn_cast<orc::RTDyldObjectLinkingLayer>(ObjLayer)) {
