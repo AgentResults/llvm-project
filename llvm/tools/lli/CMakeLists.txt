@@ -65,11 +65,35 @@ else()
   set(MAYBE_EXPORT_SYMBOLS EXPORT_SYMBOLS)
 endif()
 
+# lli's tool is a library, liblli, exporting `lli_main` (llvm-driver's `<tool>_main`, lli.cpp); the lli executable is the
+# `main` that calls it (lli-main.cpp). A process that is not lli runs lli's tool by loading the library.
+add_library(lli_library SHARED lli.cpp)
+llvm_update_compile_flags(lli_library)
+add_dependencies(lli_library intrinsics_gen)
+if(LLVM_LINK_LLVM_DYLIB)
+  set(LLI_USE_SHARED USE_SHARED)
+endif()
+llvm_config(lli_library ${LLI_USE_SHARED} ${LLVM_LINK_COMPONENTS})
+set_target_properties(lli_library PROPERTIES OUTPUT_NAME lli)
+set_output_directory(lli_library BINARY_DIR ${LLVM_RUNTIME_OUTPUT_INTDIR} LIBRARY_DIR ${LLVM_LIBRARY_OUTPUT_INTDIR})
+if(APPLE)
+  set_target_properties(lli_library PROPERTIES
+    BUILD_WITH_INSTALL_RPATH ON
+    INSTALL_RPATH "@loader_path"
+    INSTALL_NAME_DIR "@rpath")
+endif()
+install(TARGETS lli_library
+  LIBRARY DESTINATION lib${LLVM_LIBDIR_SUFFIX} COMPONENT lli
+  RUNTIME DESTINATION bin COMPONENT lli)
+
+# The directory's other source, lli.cpp, is liblli's (lli_library, above).
 add_llvm_tool(lli
-  lli.cpp
+  lli-main.cpp
+  PARTIAL_SOURCES_INTENDED
 
   DEPENDS
   intrinsics_gen
 
   ${MAYBE_EXPORT_SYMBOLS}
   )
+target_link_libraries(lli PRIVATE lli_library)

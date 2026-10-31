@@ -56,6 +56,7 @@
 #include "llvm/Support/DynamicLibrary.h"
 #include "llvm/Support/Format.h"
 #include "llvm/Support/InitLLVM.h"
+#include "llvm/Support/LLVMDriver.h"
 #include "llvm/Support/MathExtras.h"
 #include "llvm/Support/Memory.h"
 #include "llvm/Support/MemoryBuffer.h"
@@ -82,6 +83,12 @@
 #if defined(CYGWIN_VERSION_DLL_MAJOR) && CYGWIN_VERSION_DLL_MAJOR<1007
 #define DO_NOTHING_ATEXIT 1
 #endif
+#endif
+
+#if defined(__APPLE__)
+#include <crt_externs.h>
+#else
+extern "C" char **environ;
 #endif
 
 using namespace llvm;
@@ -415,7 +422,17 @@ static Expected<std::unique_ptr<orc::ExecutorProcessControl>> launchRemote();
 //===----------------------------------------------------------------------===//
 // main Driver function
 //
-int main(int argc, char **argv, char * const *envp) {
+// The tool's main as a callable function of a library (llvm-driver's `<tool>_main`), exported by liblli. The process
+// environment is what the executable's `main` was handed as envp: a library is not handed it, so it reads it as the
+// process does.
+#if defined(__APPLE__)
+static char *const *processEnvironment() { return *_NSGetEnviron(); }
+#else
+static char *const *processEnvironment() { return environ; }
+#endif
+
+LLVM_ABI_EXPORT int lli_main(int argc, char **argv, const llvm::ToolContext &) {
+  char *const *envp = processEnvironment();
   InitLLVM X(argc, argv);
 
   if (argc > 1)
