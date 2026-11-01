@@ -964,10 +964,10 @@ public:
     return true;
   }
 
-  /// The loaded image of the library the step names at Path: the one whose name is Path (a system framework of the shared cache
-  /// is no file, and is named so), else THE ONE MAPPED FROM Path's FILE - one device and inode (mappedFileOf), the identity of a
-  /// build's output (BUILD-AND-LOAD-DESIGN §5), whatever link of it dyld named the image by. A Path no image is mapped from is
-  /// refused with its cause (notLoadedCause), never dyld's words alone, which may be empty.
+  /// The loaded image of the library the step names at Path: the one whose name is Path, else THE ONE MAPPED FROM Path's FILE -
+  /// one device and inode (mappedFileOf), the identity of a build's output (BUILD-AND-LOAD-DESIGN §5), whatever link of it dyld
+  /// named the image by; a Path that names no file (a system framework of the shared cache) is the image dlopen gives the same
+  /// handle for. A Path no image answers is refused with its cause (notLoadedCause), never dyld's words alone, which may be empty.
   Expected<size_t> imageOf(StringRef Path) {
     for (size_t I = 0; I != Images.size(); ++I)
       if (Images[I].Path == Path)
@@ -982,12 +982,26 @@ public:
           return I;
       }
     }
-    // NO IMAGE IS MAPPED FROM ITS FILE: dyld's own reason, read by asking it for that path, joins the cause
+    // A NAME THAT IS NO FILE (a system framework of the shared cache: its path names no file on disk, and dyld names its image
+    // by the framework's own path) is the image dlopen gives the same handle for
     void *Handle = dlopen(P.c_str(), RTLD_LAZY | RTLD_NOLOAD);
-    if (Handle)
-      dlclose(Handle);
-    return make_error<StringError>("--dlopen " + Path + ": not a library loaded in this process - " + notLoadedCause(P),
-                                   inconvertibleErrorCode());
+    if (!Handle)
+      return make_error<StringError>("--dlopen " + Path + ": not a library loaded in this process - " + notLoadedCause(P),
+                                     inconvertibleErrorCode());
+    std::optional<size_t> Found;
+    for (size_t I = 0; I != Images.size() && !Found; ++I) {
+      void *H = dlopen(Images[I].Path.c_str(), RTLD_LAZY | RTLD_NOLOAD);
+      if (H) {
+        if (H == Handle)
+          Found = I;
+        dlclose(H);
+      }
+    }
+    dlclose(Handle);
+    if (!Found)
+      return make_error<StringError>("--dlopen " + Path + ": loaded, but its image is none of dyld's images",
+                                     inconvertibleErrorCode());
+    return *Found;
   }
 
   /// The loaded image whose path dladdr (or dyld) names, if any.
