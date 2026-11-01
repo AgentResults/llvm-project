@@ -95,6 +95,8 @@
 
 #if defined(__APPLE__)
 #include <crt_externs.h>
+#include <libproc.h>
+#include <sys/stat.h>
 #else
 extern "C" char **environ;
 #endif
@@ -946,31 +948,46 @@ public:
     }
   }
 
-  /// The loaded image dlopen resolves Path to: the one whose name is Path, else the one dlopen gives the same handle for. A
-  /// Path dyld holds no image at is refused with its cause (notLoadedCause), never dyld's words alone, which may be empty.
+  /// THE FILE AN IMAGE IS MAPPED FROM: its device and inode, as the kernel records the mapping of its header (proc_pidinfo
+  /// PROC_PIDREGIONPATHINFO) - never read off the name dyld gives the image. A file laid in every place by hard link is one inode
+  /// with many names, and dyld names an image by whichever of them the kernel answers for its file (measured 2026-11-01, macOS 26:
+  /// dlopen of one link P was named another link Q of the same file in 105 of 200 runs while another process used Q, and
+  /// dlopen(P, RTLD_NOLOAD) then answered NULL). False for an image whose header lies in no mapped file (the shared cache's).
+  bool mappedFileOf(size_t I, dev_t &Dev, ino_t &Ino) const {
+    struct proc_regionwithpathinfo R;
+    const int Got = proc_pidinfo(getpid(), PROC_PIDREGIONPATHINFO, static_cast<uint64_t>(reinterpret_cast<uintptr_t>(Images[I].Header)),
+                                 &R, sizeof R);
+    if (Got != static_cast<int>(sizeof R) || R.prp_vip.vip_vi.vi_stat.vst_ino == 0)
+      return false;
+    Dev = static_cast<dev_t>(R.prp_vip.vip_vi.vi_stat.vst_dev);
+    Ino = static_cast<ino_t>(R.prp_vip.vip_vi.vi_stat.vst_ino);
+    return true;
+  }
+
+  /// The loaded image of the library the step names at Path: the one whose name is Path (a system framework of the shared cache
+  /// is no file, and is named so), else THE ONE MAPPED FROM Path's FILE - one device and inode (mappedFileOf), the identity of a
+  /// build's output (BUILD-AND-LOAD-DESIGN §5), whatever link of it dyld named the image by. A Path no image is mapped from is
+  /// refused with its cause (notLoadedCause), never dyld's words alone, which may be empty.
   Expected<size_t> imageOf(StringRef Path) {
     for (size_t I = 0; I != Images.size(); ++I)
       if (Images[I].Path == Path)
         return I;
     std::string P = Path.str();
-    void *Handle = dlopen(P.c_str(), RTLD_LAZY | RTLD_NOLOAD);
-    if (!Handle)
-      return make_error<StringError>("--dlopen " + Path + ": not a library loaded in this process - " + notLoadedCause(P),
-                                     inconvertibleErrorCode());
-    std::optional<size_t> Found;
-    for (size_t I = 0; I != Images.size() && !Found; ++I) {
-      void *H = dlopen(Images[I].Path.c_str(), RTLD_LAZY | RTLD_NOLOAD);
-      if (H) {
-        if (H == Handle)
-          Found = I;
-        dlclose(H);
+    struct stat St;
+    if (::stat(P.c_str(), &St) == 0) {
+      for (size_t I = 0; I != Images.size(); ++I) {
+        dev_t Dev;
+        ino_t Ino;
+        if (mappedFileOf(I, Dev, Ino) && Dev == St.st_dev && Ino == St.st_ino)
+          return I;
       }
     }
-    dlclose(Handle);
-    if (!Found)
-      return make_error<StringError>("--dlopen " + Path + ": loaded, but its image is none of dyld's images",
-                                     inconvertibleErrorCode());
-    return *Found;
+    // NO IMAGE IS MAPPED FROM ITS FILE: dyld's own reason, read by asking it for that path, joins the cause
+    void *Handle = dlopen(P.c_str(), RTLD_LAZY | RTLD_NOLOAD);
+    if (Handle)
+      dlclose(Handle);
+    return make_error<StringError>("--dlopen " + Path + ": not a library loaded in this process - " + notLoadedCause(P),
+                                   inconvertibleErrorCode());
   }
 
   /// The loaded image whose path dladdr (or dyld) names, if any.
@@ -1069,11 +1086,10 @@ private:
     return std::string(reinterpret_cast<const char *>(LC) + D->dylib.name);
   }
 
-  /// WHY dyld HOLDS NO IMAGE AT P, read right after its dlopen of P was refused: dyld answers a dlopen of a dylib whose install
-  /// name an image it already holds has WITH THAT IMAGE and maps no second (one image per install name, as its two-level
-  /// namespace binds by install name), so a --dlopen of another build of a library the process holds is "loaded" and still no
-  /// image at its path. The cause names the image the process holds and the file the step names - each a build's place - or
-  /// that dyld holds no image of the file's install name; dyld's own reason follows when it gave one (an empty one is none).
+  /// WHY NO IMAGE IS MAPPED FROM P's FILE (imageOf): an image of its install name mapped from ANOTHER file - another build of
+  /// the library, which the process holds and the step does not name - or none of its install name at all. One file reached by
+  /// two of its links is one image and no cause (imageOf finds it by its device and inode). dyld's own reason follows when it
+  /// gave one (an empty one is none).
   std::string notLoadedCause(const std::string &P) {
     const char *Said = dlerror();
     std::string Dyld = Said ? Said : "";
@@ -1107,9 +1123,9 @@ private:
         for (size_t I = 0; I != Images.size() && !Held; ++I)
           if (Images[I].InstallName == Install)
             Held = I;
-        Cause = Held ? "the process holds " + Install + " at " + Images[*Held].Path + ", and the step names it at " + P +
-                           " - dyld answers a dlopen of an install name it holds with the image it holds and maps no second, so "
-                           "the process's library and the step's are two builds"
+        Cause = Held ? "the process holds " + Install + " mapped from another file (dyld names it " + Images[*Held].Path +
+                           "), and the step names it at " + P + ", a file no image of the process is mapped from, so the process's "
+                           "library and the step's are two builds"
                      : "dyld holds no image of its install name " + Install + " and mapped none at that path";
       }
     }
