@@ -73,6 +73,7 @@
 #include "llvm/Support/WithColor.h"
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/TargetParser/Triple.h"
+#include <atomic>
 #include <cerrno>
 #include <dlfcn.h>
 #include <map>
@@ -1857,6 +1858,17 @@ static int runOrcJIT(const char *ProgName) {
 
   auto J = ExitOnErr(Builder.create());
 
+  // velite: A JIT SESSION ERROR FAILS THE RUN. The session's errors - a dealloc action's refusal at teardown among them (the
+  // ORC runtime's deregistration of a graph's platform sections), which ExecutionSession::endSession returns to
+  // ~LLJIT's reportError - were printed by the default reporter while lli returned main's result, so a program whose
+  // runtime refused its teardown passed. The reporter prints each as the default does and counts it; the count outlives
+  // the JIT, whose destructor reports what its teardown refused.
+  auto SessionErrors = std::make_shared<std::atomic<unsigned>>(0);
+  J->getExecutionSession().setErrorReporter([SessionErrors](Error Err) {
+    ++*SessionErrors;
+    logAllUnhandledErrors(std::move(Err), errs(), "JIT session error: ");
+  });
+
   // a platform that is not Darwin's keeps the process symbols it always had; the line's libraries are bound beside them
   if (!Darwin)
     ExitOnErr(installLinkLine(*J, J->getMainJITDylib(), Line, false));
@@ -1998,6 +2010,13 @@ static int runOrcJIT(const char *ProgName) {
   // Run destructors.
   ExitOnErr(J->deinitialize(J->getMainJITDylib()));
 
+  // velite: end the session here, so its teardown - every graph's deallocation and the dealloc actions it runs - is
+  // reported before lli answers, and any error the session reported fails the run (EX_SOFTWARE), naming main's result
+  J.reset();
+  if (unsigned Reported = *SessionErrors) {
+    errs() << "lli: the JIT session reported " << Reported << " error(s), above; main returned " << Result << "\n";
+    return 70;
+  }
   return Result;
 }
 
