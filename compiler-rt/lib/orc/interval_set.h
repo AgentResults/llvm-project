@@ -70,13 +70,14 @@ public:
     return const_iterator(Map.find(K));
   }
 
-  void insert(KeyT KS, KeyT KE) {
-    Map.insert(std::move(KS), std::move(KE), std::monostate());
+  // The map's own answer: for a non-coalescing set, false when [KS, KE)
+  // overlaps a held interval (nothing is inserted).
+  auto insert(KeyT KS, KeyT KE) {
+    return Map.insert(std::move(KS), std::move(KE), std::monostate());
   }
 
-  void erase(KeyT KS, KeyT KE) {
-    Map.erase(KS, KE);
-  }
+  // False when no held interval wholly contains [KS, KE) (nothing is erased).
+  [[nodiscard]] bool erase(KeyT KS, KeyT KE) { return Map.erase(KS, KE); }
 
 private:
   ImplMap Map;

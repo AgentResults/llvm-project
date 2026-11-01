@@ -86,7 +86,7 @@ TEST(IntervalSetTest, EraseSplittingLeft) {
 
   S.insert(7, 10);
   EXPECT_FALSE(S.empty());
-  S.erase(9, 10);
+  EXPECT_TRUE(S.erase(9, 10));
   EXPECT_EQ(std::next(S.begin()), S.end());
   EXPECT_EQ(S.begin()->first, 7U);
   EXPECT_EQ(S.begin()->second, 9U);
@@ -99,7 +99,7 @@ TEST(IntervalSetTest, EraseSplittingRight) {
 
   S.insert(7, 10);
   EXPECT_FALSE(S.empty());
-  S.erase(7, 8);
+  EXPECT_TRUE(S.erase(7, 8));
   EXPECT_EQ(std::next(S.begin()), S.end());
   EXPECT_EQ(S.begin()->first, 8U);
   EXPECT_EQ(S.begin()->second, 10U);
@@ -112,7 +112,7 @@ TEST(IntervalSetTest, EraseSplittingBoth) {
 
   S.insert(7, 10);
   EXPECT_FALSE(S.empty());
-  S.erase(8, 9);
+  EXPECT_TRUE(S.erase(8, 9));
   EXPECT_EQ(std::next(std::next(S.begin())), S.end());
   EXPECT_EQ(S.begin()->first, 7U);
   EXPECT_EQ(S.begin()->second, 8U);

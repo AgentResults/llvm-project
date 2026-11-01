@@ -85,22 +85,28 @@ public:
     return I->second;
   }
 
-  // Erase [KS, KE), which must be entirely containing within one existing
-  // range in the map. Removal is allowed to split the range.
-  void erase(KeyT KS, KeyT KE) {
-    if (empty())
-      return;
+  // True if any range in the map overlaps [KS, KE).
+  bool overlaps(KeyT KS, KeyT KE) const {
+    auto J = Impl.lower_bound(KE); // first range starting at or after KE
+    if (J == Impl.begin())
+      return false;
+    return KS < std::prev(J)->first.second;
+  }
 
+  // Erase [KS, KE), which must be entirely contained within one existing
+  // range in the map. Removal is allowed to split the range. Returns false,
+  // changing nothing, when no range in the map wholly contains [KS, KE).
+  [[nodiscard]] bool erase(KeyT KS, KeyT KE) {
     auto J = Impl.upper_bound(KS);
 
-    // Check previous range. Bail out if range to remove is entirely after
-    // it.
-    auto I = std::prev(J);
-    if (KS >= I->first.second)
-      return;
+    // No range starts at or before KS.
+    if (J == Impl.begin())
+      return false;
 
-    // Assert that range is wholly contained.
-    assert(KE <= I->first.second);
+    // The range starting last at or before KS must hold all of [KS, KE).
+    auto I = std::prev(J);
+    if (KS >= I->first.second || KE > I->first.second)
+      return false;
 
     auto Tmp = std::move(*I);
     Impl.erase(I);
@@ -116,6 +122,7 @@ public:
     if (KS > Tmp.first.first)
       Impl.insert(
           J, std::make_pair(std::make_pair(Tmp.first.first, KS), Tmp.second));
+    return true;
   }
 
 protected:
@@ -158,8 +165,13 @@ class IntervalMap<KeyT, ValT, IntervalCoalescing::Disabled>
     : public IntervalMapBase<KeyT, ValT> {
 public:
   // Non-coalescing insert. Does not require ValT to be equality-comparable.
-  void insert(KeyT KS, KeyT KE, ValT V) {
+  // Returns false, changing nothing, when [KS, KE) overlaps a range already
+  // in the map: the map's ranges are disjoint.
+  [[nodiscard]] bool insert(KeyT KS, KeyT KE, ValT V) {
+    if (KS >= KE || this->overlaps(KS, KE))
+      return false;
     this->Impl.insert(std::make_pair(std::make_pair(KS, KE), std::move(V)));
+    return true;
   }
 };
 

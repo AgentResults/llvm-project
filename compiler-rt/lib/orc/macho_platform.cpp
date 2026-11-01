@@ -535,6 +535,44 @@ Error MachOPlatformRuntimeState::deregisterObjectSymbolTable(
   return Error::success();
 }
 
+// The code an object's unwind info covers, as disjoint ranges in address order:
+// the union of the code ranges the object's registration names. MachOPlatform
+// (findUnwindSectionInfo) names a block once for each unwind record that covers
+// it, so a function with both an FDE and a compact-unwind entry (one whose
+// compact encoding defers to DWARF) is named twice, and the map of unwind
+// sections holds disjoint ranges. Registration and deregistration of one object
+// compute the same union from the same ranges, so every range deregistered is
+// one that was registered. An empty range is ignored (as orc-rt's
+// StandaloneMachOUnwindInfoRegistrar does); an inverted one is malformed and is
+// refused, naming it, in *Why.
+static std::vector<ExecutorAddrRange>
+coveredCode(const std::vector<ExecutorAddrRange> &CodeRanges,
+            std::string *Why) {
+  std::vector<ExecutorAddrRange> Covered(CodeRanges.begin(), CodeRanges.end());
+  std::sort(Covered.begin(), Covered.end(),
+            [](const ExecutorAddrRange &L, const ExecutorAddrRange &R) {
+              return L.Start < R.Start;
+            });
+  std::vector<ExecutorAddrRange> Union;
+  for (auto &R : Covered) {
+    if (R.Start > R.End) {
+      std::ostringstream ErrStream;
+      ErrStream << "code range " << R.Start.toPtr<void *>() << " -- "
+                << R.End.toPtr<void *>() << " ends before it starts";
+      *Why = ErrStream.str();
+      return {};
+    }
+    if (R.Start == R.End)
+      continue;
+    if (!Union.empty() && R.Start <= Union.back().End) {
+      if (R.End > Union.back().End)
+        Union.back().End = R.End;
+    } else
+      Union.push_back(R);
+  }
+  return Union;
+}
+
 Error MachOPlatformRuntimeState::registerObjectPlatformSections(
     ExecutorAddr HeaderAddr, std::optional<UnwindSectionInfo> UnwindInfo,
     std::vector<std::pair<std::string_view, ExecutorAddrRange>> Secs) {
@@ -574,9 +612,33 @@ Error MachOPlatformRuntimeState::registerObjectPlatformSections(
                UnwindInfo->CompactUnwindSection.Start.toPtr<void *>(),
                UnwindInfo->CompactUnwindSection.End.toPtr<void *>());
     });
-    for (auto &CodeRange : UnwindInfo->CodeRanges) {
-      JDS->UnwindSections.insert(CodeRange.Start.toPtr<char *>(),
-                                 CodeRange.End.toPtr<char *>(), *UnwindInfo);
+    std::string Why;
+    auto Covered = coveredCode(UnwindInfo->CodeRanges, &Why);
+    if (!Why.empty()) {
+      std::ostringstream ErrStream;
+      ErrStream << "Could not register unwind info of header "
+                << HeaderAddr.toPtr<void *>() << ": " << Why;
+      return make_error<StringError>(ErrStream.str());
+    }
+    for (auto &CodeRange : Covered) {
+      if (JDS->UnwindSections.overlaps(CodeRange.Start.toPtr<char *>(),
+                                       CodeRange.End.toPtr<char *>())) {
+        std::ostringstream ErrStream;
+        ErrStream << "Could not register unwind info for code range "
+                  << CodeRange.Start.toPtr<void *>() << " -- "
+                  << CodeRange.End.toPtr<void *>() << " of header "
+                  << HeaderAddr.toPtr<void *>()
+                  << ": it overlaps a code range whose unwind info is "
+                     "already registered";
+        return make_error<StringError>(ErrStream.str());
+      }
+    }
+    for (auto &CodeRange : Covered) {
+      bool Inserted = JDS->UnwindSections.insert(
+          CodeRange.Start.toPtr<char *>(), CodeRange.End.toPtr<char *>(),
+          *UnwindInfo);
+      assert(Inserted && "disjoint ranges checked above");
+      (void)Inserted;
       ORC_RT_DEBUG({
         printdbg("    [ %p -- %p ]\n", CodeRange.Start.toPtr<void *>(),
                  CodeRange.End.toPtr<void *>());
@@ -647,6 +709,7 @@ Error MachOPlatformRuntimeState::deregisterObjectPlatformSections(
   // any Swift or ObjC. Once this happens we can clear (and no longer record)
   // data section content, as the library could never be re-initialized.
 
+  std::vector<std::string> Refusals;
   if (UnwindInfo && UseCallbackStyleUnwindInfo) {
     ORC_RT_DEBUG({
       printdbg("  Deregistering new-style unwind info for:\n"
@@ -658,9 +721,24 @@ Error MachOPlatformRuntimeState::deregisterObjectPlatformSections(
                UnwindInfo->CompactUnwindSection.Start.toPtr<void *>(),
                UnwindInfo->CompactUnwindSection.End.toPtr<void *>());
     });
-    for (auto &CodeRange : UnwindInfo->CodeRanges) {
-      JDS->UnwindSections.erase(CodeRange.Start.toPtr<char *>(),
-                                CodeRange.End.toPtr<char *>());
+    // Everything this object registered is deregistered that can be, and every
+    // refusal is reported together: one refusal never leaves the rest of the
+    // object registered over memory its deallocation then releases.
+    std::string Why;
+    auto Covered = coveredCode(UnwindInfo->CodeRanges, &Why);
+    if (!Why.empty())
+      Refusals.push_back("unwind info: " + Why);
+    for (auto &CodeRange : Covered) {
+      if (!JDS->UnwindSections.erase(CodeRange.Start.toPtr<char *>(),
+                                     CodeRange.End.toPtr<char *>())) {
+        std::ostringstream ErrStream;
+        ErrStream << "unwind info for code range "
+                  << CodeRange.Start.toPtr<void *>() << " -- "
+                  << CodeRange.End.toPtr<void *>()
+                  << ": no registered code range holds it";
+        Refusals.push_back(ErrStream.str());
+        continue;
+      }
       ORC_RT_DEBUG({
         printdbg("    [ %p -- %p ]\n", CodeRange.Start.toPtr<void *>(),
                  CodeRange.End.toPtr<void *>());
@@ -674,7 +752,7 @@ Error MachOPlatformRuntimeState::deregisterObjectPlatformSections(
       if (!UseCallbackStyleUnwindInfo) {
         // Use classic libunwind registration.
         if (auto Err = deregisterEHFrames(KV.second.toSpan<const char>()))
-          return Err;
+          Refusals.push_back(toString(std::move(Err)));
       }
     } else if (KV.first == "__DATA,__data") {
       JDS->DataSectionContent.erase(KV.second.Start.toPtr<char *>());
@@ -683,20 +761,24 @@ Error MachOPlatformRuntimeState::deregisterObjectPlatformSections(
     } else if (KV.first == "__DATA,__thread_data") {
       if (auto Err =
               deregisterThreadDataSection(KV.second.toSpan<const char>()))
-        return Err;
+        Refusals.push_back(toString(std::move(Err)));
     } else if (KV.first == "__llvm_jitlink_ObjCRuntimeRegistrationObject")
       JDS->ObjCRuntimeRegistrationObjects.removeIfPresent(KV.second);
     else if (KV.first == "__DATA,__mod_init_func")
       JDS->ModInitsSections.removeIfPresent(KV.second);
-    else {
-      // Should this be a warning instead?
-      return make_error<StringError>(
-          "Encountered unexpected section " +
-          std::string(KV.first.data(), KV.first.size()) +
-          " while deregistering object platform sections");
-    }
+    else
+      Refusals.push_back("unexpected section " +
+                         std::string(KV.first.data(), KV.first.size()));
   }
-  return Error::success();
+  if (Refusals.empty())
+    return Error::success();
+  std::ostringstream ErrStream;
+  ErrStream << "Could not deregister all object platform sections of header "
+            << HeaderAddr.toPtr<void *>() << " (" << Refusals.size()
+            << " refused):";
+  for (auto &R : Refusals)
+    ErrStream << " [" << R << "]";
+  return make_error<StringError>(ErrStream.str());
 }
 
 const char *MachOPlatformRuntimeState::dlerror() { return DLFcnError.c_str(); }

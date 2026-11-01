@@ -142,7 +142,7 @@ TEST(IntervalMapTest, EraseSingleElement) {
 
   M.insert(7, 10, 42);
   EXPECT_FALSE(M.empty());
-  M.erase(7, 10);
+  EXPECT_TRUE(M.erase(7, 10));
   EXPECT_TRUE(M.empty());
 }
 
@@ -153,7 +153,7 @@ TEST(IntervalMapTest, EraseSplittingLeft) {
 
   M.insert(7, 10, 42);
   EXPECT_FALSE(M.empty());
-  M.erase(9, 10);
+  EXPECT_TRUE(M.erase(9, 10));
   EXPECT_EQ(std::next(M.begin()), M.end());
   EXPECT_EQ(M.begin()->first.first, 7U);
   EXPECT_EQ(M.begin()->first.second, 9U);
@@ -166,7 +166,7 @@ TEST(IntervalMapTest, EraseSplittingRight) {
 
   M.insert(7, 10, 42);
   EXPECT_FALSE(M.empty());
-  M.erase(7, 8);
+  EXPECT_TRUE(M.erase(7, 8));
   EXPECT_EQ(std::next(M.begin()), M.end());
   EXPECT_EQ(M.begin()->first.first, 8U);
   EXPECT_EQ(M.begin()->first.second, 10U);
@@ -179,7 +179,7 @@ TEST(IntervalMapTest, EraseSplittingBoth) {
 
   M.insert(7, 10, 42);
   EXPECT_FALSE(M.empty());
-  M.erase(8, 9);
+  EXPECT_TRUE(M.erase(8, 9));
   EXPECT_EQ(std::next(std::next(M.begin())), M.end());
   EXPECT_EQ(M.begin()->first.first, 7U);
   EXPECT_EQ(M.begin()->first.second, 8U);
@@ -195,7 +195,7 @@ TEST(IntervalMapTest, NonCoalescingMapPermitsNonComparableKeys) {
 
   IntervalMap<unsigned, S, IntervalCoalescing::Disabled> M;
 
-  M.insert(7, 8, S());
+  EXPECT_TRUE(M.insert(7, 8, S()));
 
   EXPECT_FALSE(M.empty());
   EXPECT_EQ(std::next(M.begin()), M.end());
