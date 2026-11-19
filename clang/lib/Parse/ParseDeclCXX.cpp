@@ -229,7 +229,7 @@ void Parser::ParseInnerNamespace(const InnerNamespaceInfoList &InnerNSs,
                                  BalancedDelimiterTracker &Tracker) {
   if (index == InnerNSs.size()) {
     while (!tryParseMisplacedModuleImport() && Tok.isNot(tok::r_brace) &&
-           Tok.isNot(tok::eof)) {
+           !isEofOrEom()) {
       ParsedAttributes DeclAttrs(AttrFactory);
       MaybeParseCXX11Attributes(DeclAttrs);
       ParsedAttributes EmptyDeclSpecAttrs(AttrFactory);
@@ -428,7 +428,7 @@ Decl *Parser::ParseExportDeclaration() {
   T.consumeOpen();
 
   while (!tryParseMisplacedModuleImport() && Tok.isNot(tok::r_brace) &&
-         Tok.isNot(tok::eof)) {
+         !isEofOrEom()) {
     ParsedAttributes DeclAttrs(AttrFactory);
     MaybeParseCXX11Attributes(DeclAttrs);
     ParsedAttributes EmptyDeclSpecAttrs(AttrFactory);
@@ -3689,7 +3689,7 @@ void Parser::ParseCXXMemberSpecification(SourceLocation RecordLoc,
   if (TagDecl) {
     // While we still have something to read, read the member-declarations.
     while (!tryParseMisplacedModuleImport() && Tok.isNot(tok::r_brace) &&
-           Tok.isNot(tok::eof)) {
+           !isEofOrEom()) {
       // Each iteration of this loop reads one member-declaration.
       ParseCXXClassMemberDeclarationWithPragmas(
           CurAS, AccessAttrs, static_cast<DeclSpec::TST>(TagType), TagDecl);

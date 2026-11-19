@@ -1196,7 +1196,7 @@ StmtResult Parser::ParseCompoundStatementBody(bool isStmtExpr) {
 
   bool LastIsError = false;
   while (!tryParseMisplacedModuleImport() && Tok.isNot(tok::r_brace) &&
-         Tok.isNot(tok::eof)) {
+         !isEofOrEom()) {
     if (Tok.is(tok::annot_pragma_unused)) {
       HandlePragmaUnused();
       continue;
